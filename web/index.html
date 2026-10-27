@@ -1,0 +1,241 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Canopy Prototype</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,300;9..144,500&family=Instrument+Sans:wght@400;500;600&family=JetBrains+Mono:wght@400&display=swap">
+<style>
+/* Layout: full-bleed color field (the canopy), a large reading, and one small card at the bottom with the two things you need: token and connect. Everything else folds away under "Tuning". */
+:root {
+  --bg: #0d0b10;
+  --fg: #f3eee6;
+  --muted: rgba(243,238,230,0.6);
+  --panel: rgba(13,11,16,0.74);
+  --line: rgba(243,238,230,0.14);
+  --accent: #e8c27a;
+  --ok: #7fd7a8;
+  --bad: #f08a7c;
+  --display: "Fraunces", "Iowan Old Style", Georgia, serif;
+  --body: "Instrument Sans", "Helvetica Neue", Arial, sans-serif;
+  --mono: "JetBrains Mono", ui-monospace, Menlo, monospace;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+html, body { height: 100%; margin: 0; }
+body { background: var(--bg); color: var(--fg); font-family: var(--body); font-size: 14px; line-height: 1.45; overflow: hidden; }
+#canopy { position: fixed; inset: 0; width: 100%; height: 100%; display: block; }
+
+.readout {
+  position: fixed; inset: 0 0 auto 0;
+  display: flex; flex-direction: column; align-items: center; gap: 6px;
+  padding-block: 9vh 0;
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+  pointer-events: none; text-align: center;
+}
+.readout .bpm { font-family: var(--display); font-weight: 300; font-size: clamp(80px, 18vw, 180px); line-height: 1; letter-spacing: -0.02em; font-variant-numeric: tabular-nums; text-shadow: 0 2px 24px rgba(0,0,0,0.35); }
+.readout .label { text-transform: uppercase; letter-spacing: 0.14em; font-size: 11px; color: var(--muted); }
+.readout .sub { font-size: 14px; color: var(--muted); max-width: 36ch; text-wrap: balance; }
+
+.card {
+  position: fixed; left: 50%; bottom: 0; transform: translateX(-50%);
+  width: min(560px, 100% - 32px);
+  margin-bottom: max(36px, env(safe-area-inset-bottom, 0px) + 28px);
+  background: var(--panel); backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px);
+  border: 1px solid var(--line); border-radius: 14px;
+  padding: 18px 20px 20px;
+  display: flex; flex-direction: column; gap: 14px;
+  max-height: calc(100vh - 36vh); overflow-y: auto;
+}
+.top { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.top h1 { font-family: var(--display); font-weight: 500; font-size: 18px; margin: 0; }
+.status { display: inline-flex; align-items: center; gap: 7px; font-size: 12px; color: var(--muted); }
+.status::before { content: ""; width: 8px; height: 8px; border-radius: 50%; background: var(--muted); flex: none; }
+.status.ok { color: var(--ok); } .status.ok::before { background: var(--ok); box-shadow: 0 0 10px var(--ok); }
+.status.bad { color: var(--bad); } .status.bad::before { background: var(--bad); }
+
+.row { display: flex; gap: 8px; align-items: center; }
+.row > * { min-width: 0; }
+input[type=password], input[type=text] { flex: 1; background: rgba(255,255,255,0.06); border: 1px solid var(--line); color: var(--fg); border-radius: 8px; padding: 10px 12px; font: 12px var(--mono); }
+button { background: var(--accent); color: #1a1407; border: 0; border-radius: 8px; padding: 10px 16px; font: 600 13px var(--body); cursor: pointer; white-space: nowrap; }
+button.ghost { background: transparent; color: var(--fg); border: 1px solid var(--line); font-weight: 500; }
+button:focus-visible, input:focus-visible, select:focus-visible, summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+.sim { display: flex; align-items: center; gap: 12px; font-size: 13px; color: var(--muted); }
+.sim input[type=range] { flex: 1; accent-color: var(--accent); }
+.sim .v { font-family: var(--mono); font-size: 12px; min-width: 6ch; text-align: right; font-variant-numeric: tabular-nums; }
+
+details { border-top: 1px solid var(--line); padding-top: 10px; }
+summary { cursor: pointer; font-size: 12px; text-transform: uppercase; letter-spacing: 0.12em; color: var(--muted); list-style: none; }
+summary::-webkit-details-marker { display: none; }
+summary::after { content: "  +"; } details[open] summary::after { content: "  –"; }
+.tune { display: flex; flex-direction: column; gap: 10px; margin-top: 12px; }
+label { display: flex; align-items: center; justify-content: space-between; gap: 12px; font-size: 13px; }
+label .v { font-family: var(--mono); font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
+input[type=range] { width: 46%; accent-color: var(--accent); }
+input[type=checkbox] { accent-color: var(--accent); }
+select { background: rgba(255,255,255,0.06); color: var(--fg); border: 1px solid var(--line); border-radius: 8px; padding: 6px 8px; font: 13px var(--body); }
+.hint { font-size: 12px; color: var(--muted); margin: 0; }
+.swatches { display: flex; height: 8px; border-radius: 4px; overflow: hidden; }
+.swatches i { flex: 1; }
+</style>
+</head>
+<body>
+
+<canvas id="canopy" aria-hidden="true"></canvas>
+
+<div class="readout">
+  <div class="label" id="srcLabel">waiting for heart rate</div>
+  <div class="bpm" id="bpm">--</div>
+  <div class="sub" id="sub">Paste your Pulsoid token below and connect.</div>
+</div>
+
+<div class="card">
+  <div class="top">
+    <h1>Canopy Prototype</h1>
+    <span class="status" id="status">not connected</span>
+  </div>
+
+  <div class="row">
+    <input type="password" id="token" placeholder="Pulsoid access token" autocomplete="off">
+    <button id="connect" type="button">Connect</button>
+  </div>
+
+  <div class="sim">
+    <input type="checkbox" id="simOn" title="Simulate">
+    <span>Simulate</span>
+    <input type="range" id="sim" min="45" max="130" value="80">
+    <span class="v" id="simV">80 bpm</span>
+  </div>
+
+  <details>
+    <summary>Tuning</summary>
+    <div class="tune">
+      <label>Baseline <span class="v" id="baseV">sets after 30 s</span></label>
+      <div class="row"><button class="ghost" id="setBase" type="button">Set baseline from current reading</button></div>
+      <label>Calm target, bpm below baseline <input type="range" id="drop" min="5" max="40" value="20"> <span class="v" id="dropV">20</span></label>
+      <label>Smoothing <input type="range" id="smooth" min="0" max="30" value="10"> <span class="v" id="smoothV">10 s</span></label>
+      <label>Stepped palette, one color per <input type="range" id="step" min="1" max="6" value="2"> <span class="v" id="stepV">2 bpm</span></label>
+      <label><span><input type="checkbox" id="stepped"> use stepped palette</span></label>
+      <label>Palette <select id="palette"><option value="cool">calm blue → warm amber</option><option value="party">calm violet → magenta → red</option><option value="forest">calm green → gold</option></select></label>
+      <div class="swatches" id="swatches"></div>
+      <div class="row"><button class="ghost" id="copyLog" type="button">Copy session as CSV</button><span class="hint" id="copied"></span></div>
+    </div>
+  </details>
+</div>
+
+<script>
+(function () {
+  const $ = id => document.getElementById(id);
+  const state = { ws: null, simTimer: null, smoothed: null, baseline: null, firstSampleAt: null, samples: [], log: [], hue: 225 };
+
+  // ---------- palette ----------
+  const PALETTES = { cool: { h0: 225, h1: 35 }, party: { h0: 265, h1: 375 }, forest: { h0: 150, h1: 45 } };
+  const hueFor = t => { const p = PALETTES[$('palette').value]; return ((p.h0 + (p.h1 - p.h0) * t) % 360 + 360) % 360; };
+  function drawSwatches() { const el = $('swatches'); el.innerHTML = ''; for (let i = 0; i < 24; i++) { const s = document.createElement('i'); s.style.background = `hsl(${hueFor(i / 23)} 70% 55%)`; el.appendChild(s); } }
+
+  // ---------- mapping: 0 = calm target, 1 = baseline ----------
+  function targetT() {
+    if (state.smoothed == null) return null;
+    const base = state.baseline ?? state.smoothed, drop = +$('drop').value;
+    let hr = state.smoothed;
+    if ($('stepped').checked) { const s = +$('step').value; hr = Math.round(hr / s) * s; }
+    return Math.max(0, Math.min(1.15, (hr - (base - drop)) / drop));
+  }
+
+  function pushSample(hr, source) {
+    const now = Date.now();
+    state.samples.push({ t: now, hr });
+    const win = +$('smooth').value * 1000;
+    state.samples = state.samples.filter(s => now - s.t <= Math.max(win, 1));
+    state.smoothed = win === 0 ? hr : state.samples.reduce((a, s) => a + s.hr, 0) / state.samples.length;
+    if (!state.firstSampleAt) state.firstSampleAt = now;
+    if (state.baseline == null && now - state.firstSampleAt >= 30000) setBaseline();
+    state.hue = hueFor(Math.min(1, targetT()));
+    state.log.push(`${new Date(now).toISOString().slice(11, 19)},${hr},${state.smoothed.toFixed(1)},${state.hue.toFixed(0)}`);
+    $('bpm').textContent = Math.round(hr);
+    $('srcLabel').textContent = source;
+    const calm = state.baseline == null ? null : state.baseline - +$('drop').value;
+    $('sub').textContent = calm == null ? 'Sit still. Your baseline sets after 30 seconds.'
+      : state.smoothed <= calm ? 'You reached the calm target.' : `${Math.round(state.smoothed - calm)} bpm above the calm target.`;
+  }
+  function setBaseline() { if (state.smoothed == null) return; state.baseline = Math.round(state.smoothed); $('baseV').textContent = state.baseline + ' bpm'; }
+
+  // ---------- Pulsoid websocket ----------
+  function setStatus(text, cls) { const s = $('status'); s.textContent = text; s.className = 'status' + (cls ? ' ' + cls : ''); }
+  function connect() {
+    const token = $('token').value.trim();
+    if (!token) { setStatus('paste a token first', 'bad'); return; }
+    try { localStorage.setItem('pulsoid_token', token); } catch (e) {}
+    disconnect(); $('simOn').checked = false; stopSim();
+    setStatus('connecting…');
+    const ws = new WebSocket(`wss://dev.pulsoid.net/api/v1/data/real_time?access_token=${encodeURIComponent(token)}`);
+    state.ws = ws;
+    ws.onopen = () => setStatus('connected, waiting for a reading', 'ok');
+    ws.onmessage = ev => {
+      let hr = null;
+      try { const j = JSON.parse(ev.data); hr = j?.data?.heart_rate ?? j?.heart_rate ?? null; } catch (e) { hr = parseInt(ev.data, 10); }
+      if (hr && hr > 20 && hr < 250) { setStatus('live', 'ok'); pushSample(hr, 'live heart rate'); }
+    };
+    ws.onerror = () => setStatus('could not connect. Check the token and that the watch is measuring.', 'bad');
+    ws.onclose = ev => { if (state.ws === ws) { state.ws = null; if (ev.code === 1000) setStatus('not connected'); else { setStatus('connection dropped, retrying', 'bad'); setTimeout(() => { if (!state.ws && !$('simOn').checked) connect(); }, 5000); } } };
+    $('connect').textContent = 'Reconnect';
+  }
+  function disconnect() { if (state.ws) { const w = state.ws; state.ws = null; w.close(1000); } }
+
+  // ---------- simulator ----------
+  function startSim() { disconnect(); setStatus('simulating', 'ok'); tickSim(); state.simTimer = setInterval(tickSim, 1000); }
+  function tickSim() { pushSample(Math.round(+$('sim').value + (Math.random() * 4 - 2)), 'simulated heart rate'); }
+  function stopSim() { clearInterval(state.simTimer); if (!state.ws) setStatus('not connected'); }
+
+  // ---------- canopy drawing ----------
+  const canvas = $('canopy'), ctx = canvas.getContext('2d');
+  let lights = [], shownHue = 225, shownT = 1;
+  function resize() {
+    canvas.width = innerWidth * devicePixelRatio; canvas.height = innerHeight * devicePixelRatio;
+    ctx.setTransform(devicePixelRatio, 0, 0, devicePixelRatio, 0, 0);
+    const n = Math.round((innerWidth * innerHeight) / 9000);
+    lights = Array.from({ length: n }, () => ({ x: Math.random() * innerWidth, y: Math.random() * innerHeight * 0.7, r: 2 + Math.random() * 2.5, ph: Math.random() * Math.PI * 2, tw: 0.6 + Math.random() * 0.8 }));
+  }
+  function frame(now) {
+    const t = targetT(); const tt = t == null ? 1 : Math.min(1, t);
+    shownHue += (((state.hue - shownHue + 540) % 360) - 180) * 0.03;
+    shownT += (tt - shownT) * 0.03;
+    const bpm = state.smoothed ?? 70;
+    const beat = 0.5 + 0.5 * Math.sin((now / 1000) * (bpm / 60) * 2 * Math.PI);   // the lights breathe at the current heart rate
+    const sat = 55 + 25 * shownT, lit = 10 + 6 * shownT;
+    ctx.fillStyle = `hsl(${shownHue} ${sat}% ${lit}%)`; ctx.fillRect(0, 0, innerWidth, innerHeight);
+    const g = ctx.createRadialGradient(innerWidth / 2, innerHeight * 0.35, 0, innerWidth / 2, innerHeight * 0.35, innerWidth * 0.7);
+    g.addColorStop(0, `hsl(${shownHue} ${sat}% ${lit + 10}% / 0.9)`); g.addColorStop(1, 'transparent');
+    ctx.fillStyle = g; ctx.fillRect(0, 0, innerWidth, innerHeight);
+    for (const l of lights) {
+      const a = (0.45 + 0.45 * beat * (0.4 + 0.6 * shownT)) * (0.75 + 0.25 * Math.sin(now / 1000 * l.tw + l.ph));
+      ctx.beginPath(); ctx.arc(l.x, l.y, l.r * 3.2, 0, Math.PI * 2); ctx.fillStyle = `hsl(${shownHue} 90% 70% / ${a * 0.25})`; ctx.fill();
+      ctx.beginPath(); ctx.arc(l.x, l.y, l.r, 0, Math.PI * 2); ctx.fillStyle = `hsl(${shownHue} 70% 88% / ${a})`; ctx.fill();
+    }
+    requestAnimationFrame(frame);
+  }
+
+  // ---------- wiring ----------
+  $('connect').onclick = connect;
+  $('token').addEventListener('keydown', e => { if (e.key === 'Enter') connect(); });
+  $('simOn').onchange = () => $('simOn').checked ? startSim() : stopSim();
+  $('sim').oninput = () => $('simV').textContent = $('sim').value + ' bpm';
+  $('setBase').onclick = setBaseline;
+  $('drop').oninput = () => $('dropV').textContent = $('drop').value;
+  $('smooth').oninput = () => $('smoothV').textContent = $('smooth').value + ' s';
+  $('step').oninput = () => $('stepV').textContent = $('step').value + ' bpm';
+  $('palette').onchange = drawSwatches;
+  $('copyLog').onclick = () => {
+    navigator.clipboard.writeText('time,raw,smoothed,hue\n' + state.log.join('\n'))
+      .then(() => { $('copied').textContent = `copied ${state.log.length} rows`; setTimeout(() => $('copied').textContent = '', 2000); })
+      .catch(() => { $('copied').textContent = 'clipboard blocked by browser'; });
+  };
+  try { const t = localStorage.getItem('pulsoid_token'); if (t) $('token').value = t; } catch (e) {}
+  addEventListener('resize', resize); resize(); drawSwatches(); requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
