@@ -16,7 +16,7 @@ heart rate sensor --(Bluetooth)--> controller --(data line)--> addressable LED f
 
 Two stages:
 
-1. **Now (web prototype, `web/index.html`).** Apple Watch streams heart rate through the Pulsoid app to a websocket; a single HTML page reads it and paints the screen as a stand-in canopy. Runs as a local file (double-click), not hosted, because browsers only allow the Pulsoid websocket from a local or same-origin page.
+1. **Now (web prototype, `web/index.html`).** Apple Watch streams heart rate through the Pulsoid app to a websocket; a single HTML page reads it and paints the screen as a stand-in canopy. Hosted at https://yanmaggie53.github.io/heart-rate-canopy/ by GitHub Pages (`.github/workflows/pages.yml` publishes the `web/` folder on every push to main); it also runs as a local file by double-clicking. The Pulsoid websocket is wss and is not restricted by page origin (a handshake probe from a github.io origin was rejected for the token, not the origin), so the hosted page can use it. An earlier note here claimed only a local page could; that was wrong.
 2. **Later (gallery piece, `firmware/`, not started).** ESP32 reads a Polar sensor directly over Bluetooth (standard Heart Rate Service 0x180D, characteristic 0x2A37) and drives WS2812B fairy lights. No laptop in the gallery.
 
 ## Decisions already made
