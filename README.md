@@ -9,7 +9,7 @@ A canopy with cushions inside. Fairy lights in the canopy change color with the 
 3. Open `web/index.html` in a browser by double-clicking it.
 4. Paste the token, press Connect, sit still for 30 seconds while the baseline sets.
 
-No install, no build step. The page also has a simulate slider so the mapping can be shown without a watch.
+No install, no build step. Under Tuning there is a test mode that feeds a fake reading, for checking the colors without a watch.
 
 ## Layout
 
