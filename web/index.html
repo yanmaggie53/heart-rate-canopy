@@ -76,10 +76,10 @@ label { display: flex; align-items: center; justify-content: space-between; gap:
 label .v { font-family: var(--mono); font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
 input[type=range] { width: 46%; accent-color: var(--accent); }
 input[type=checkbox] { accent-color: var(--accent); }
-select { background: rgba(255,255,255,0.06); color: var(--fg); border: 1px solid var(--line); border-radius: 8px; padding: 6px 8px; font: 13px var(--body); }
 .hint { font-size: 12px; color: var(--muted); margin: 0; }
 .swatches { display: flex; height: 8px; border-radius: 4px; overflow: hidden; }
 .swatches i { flex: 1; }
+.ticks { display: flex; justify-content: space-between; font-family: var(--mono); font-size: 11px; color: var(--muted); margin-top: -4px; }
 </style>
 </head>
 <body>
@@ -106,22 +106,22 @@ select { background: rgba(255,255,255,0.06); color: var(--fg); border: 1px solid
   <details>
     <summary>Tuning</summary>
     <div class="tune">
-      <label>Baseline <span class="v" id="baseV">sets after 30 s</span></label>
-      <div class="row"><button class="ghost" id="setBase" type="button">Set baseline from current reading</button></div>
-      <label>Calm target, bpm below baseline <input type="range" id="drop" min="5" max="40" value="20"> <span class="v" id="dropV">20</span></label>
+      <label>Purple at <input type="range" id="floor" min="40" max="80" value="55"> <span class="v" id="floorV">55 bpm</span></label>
+      <label>Red at <input type="range" id="ceil" min="70" max="130" value="95"> <span class="v" id="ceilV">95 bpm</span></label>
+      <div class="swatches" id="swatches"></div>
+      <div class="ticks"><span id="tickLo">55</span><span id="tickMid">75</span><span id="tickHi">95 bpm</span></div>
       <label>Smoothing <input type="range" id="smooth" min="0" max="30" value="5"> <span class="v" id="smoothV">5 s</span></label>
       <label>Stepped palette, one color per <input type="range" id="step" min="1" max="6" value="2"> <span class="v" id="stepV">2 bpm</span></label>
       <label><span><input type="checkbox" id="stepped"> use stepped palette</span></label>
-      <label>Color wheel <span class="v">calm → baseline → elevated</span></label>
-      <div class="swatches" id="swatches"></div>
+      <label>Started at <span class="v" id="startV">average of the first 30 s</span></label>
       <div class="row"><button class="ghost" id="copyLog" type="button">Copy session as CSV</button><span class="hint" id="copied"></span></div>
       <div class="sim">
         <input type="checkbox" id="simOn" title="Test without a watch">
         <span>Test without a watch</span>
-        <input type="range" id="sim" min="45" max="130" value="80">
-        <span class="v" id="simV">80 bpm</span>
+        <input type="range" id="sim" min="45" max="120" value="75">
+        <span class="v" id="simV">75 bpm</span>
       </div>
-      <p class="hint">Test mode feeds a fake reading, with the baseline set to wherever the slider starts, so the colors can be checked without a watch. Connecting to Pulsoid turns it off and starts a fresh baseline.</p>
+      <p class="hint">Test mode feeds an exact fake reading so each color can be checked without a watch. Connecting to Pulsoid turns it off.</p>
     </div>
   </details>
 </div>
@@ -129,27 +129,30 @@ select { background: rgba(255,255,255,0.06); color: var(--fg); border: 1px solid
 <script>
 (function () {
   const $ = id => document.getElementById(id);
-  const state = { ws: null, simTimer: null, smoothed: null, baseline: null, firstSampleAt: null, samples: [], opening: [], log: [], hue: 240 };
+  const state = { ws: null, simTimer: null, smoothed: null, start: null, firstSampleAt: null, samples: [], opening: [], log: [], hue: 280 };
 
-  // ---------- color: the whole wheel, cool when calm, warm when elevated ----------
-  // t = 0 calm target -> blue (240), t = 1 baseline -> yellow (60), t = 2 one drop above baseline -> magenta (330).
-  // The calm side spends 180 degrees (blue, cyan, green, yellow) over one drop; the elevated side spends 90 (orange, red, magenta) over one drop.
-  const T_MAX = 2;
-  const hueFor = t => { t = Math.max(0, Math.min(T_MAX, t)); const h = t <= 1 ? 240 - 180 * t : 60 - 90 * (t - 1); return (h % 360 + 360) % 360; };
-  function drawSwatches() { const el = $('swatches'); el.innerHTML = ''; for (let i = 0; i < 30; i++) { const s = document.createElement('i'); s.style.background = `hsl(${hueFor(T_MAX * i / 29)} 85% 55%)`; el.appendChild(s); } }
-
-  // ---------- mapping: 0 = calm target, 1 = baseline ----------
+  // ---------- mapping: a fixed scale in bpm ----------
+  // Tuned for people sitting in a gallery, mostly students: purple at the floor (55 bpm by default), red at the ceiling (95).
+  // Hue runs down the wheel from purple (280) through blue, cyan, green, yellow and orange to red (0): about 7 degrees per bpm
+  // with the default range, so a change of one beat per minute is a visible shift. t = 0 at the floor, 1 at the ceiling.
+  const HUE_LOW = 280, HUE_HIGH = 0;
+  const floorBpm = () => +$('floor').value;
+  const ceilBpm = () => Math.max(floorBpm() + 5, +$('ceil').value);
   function targetT() {
     if (state.smoothed == null) return null;
-    const base = state.baseline ?? openingAverage(), drop = +$('drop').value;
     let hr = state.smoothed;
     if ($('stepped').checked) { const s = +$('step').value; hr = Math.round(hr / s) * s; }
-    return Math.max(0, Math.min(T_MAX, (hr - (base - drop)) / drop));
+    return Math.max(0, Math.min(1, (hr - floorBpm()) / (ceilBpm() - floorBpm())));
   }
-  // Average of every reading since the first one. Used as the baseline once 30 s have passed, and as a stand-in before that.
-  // (Using the current smoothed reading as its own baseline pins t at 1, so the color never moves during the first 30 s.)
-  function openingAverage() { return state.opening.reduce((a, s) => a + s.hr, 0) / state.opening.length; }
+  const hueFor = t => HUE_LOW - (HUE_LOW - HUE_HIGH) * Math.max(0, Math.min(1, t));
+  function drawSwatches() {
+    const el = $('swatches'); el.innerHTML = '';
+    for (let i = 0; i < 40; i++) { const s = document.createElement('i'); s.style.background = `hsl(${hueFor(i / 39)} 85% 55%)`; el.appendChild(s); }
+    $('tickLo').textContent = floorBpm(); $('tickMid').textContent = Math.round((floorBpm() + ceilBpm()) / 2); $('tickHi').textContent = ceilBpm() + ' bpm';
+    $('floorV').textContent = floorBpm() + ' bpm'; $('ceilV').textContent = ceilBpm() + ' bpm';
+  }
 
+  // ---------- readings ----------
   function pushSample(hr, source) {
     const now = Date.now();
     state.samples.push({ t: now, hr });
@@ -157,17 +160,20 @@ select { background: rgba(255,255,255,0.06); color: var(--fg); border: 1px solid
     state.samples = state.samples.filter(s => now - s.t <= Math.max(win, 1));
     state.smoothed = win === 0 ? hr : state.samples.reduce((a, s) => a + s.hr, 0) / state.samples.length;
     if (!state.firstSampleAt) state.firstSampleAt = now;
-    if (state.baseline == null) { state.opening.push({ t: now, hr }); if (now - state.firstSampleAt >= 30000) setBaseline(openingAverage()); }
+    // "Started at" is the average of the first 30 s. It only feeds the line under the reading; the color is on the fixed scale.
+    if (state.start == null) { state.opening.push(hr); if (now - state.firstSampleAt >= 30000) setStart(); }
     state.hue = hueFor(targetT());
     state.log.push(`${new Date(now).toISOString().slice(11, 19)},${hr},${state.smoothed.toFixed(1)},${state.hue.toFixed(0)}`);
     $('bpm').textContent = Math.round(hr);
     $('srcLabel').textContent = source;
-    const calm = state.baseline == null ? null : state.baseline - +$('drop').value;
-    $('sub').textContent = calm == null ? 'Sit still. Your baseline sets after 30 seconds.'
-      : state.smoothed <= calm ? 'You reached the calm target.' : `${Math.round(state.smoothed - calm)} bpm above the calm target.`;
+    if (state.start == null) { $('sub').textContent = 'Sit still and breathe slowly. A slower heart turns the canopy cooler.'; }
+    else {
+      const d = Math.round(state.smoothed - state.start);
+      $('sub').textContent = d <= -1 ? `${-d} bpm lower than when you sat down.` : d >= 1 ? `${d} bpm higher than when you sat down.` : 'Same as when you sat down.';
+    }
   }
-  function setBaseline(value) { if (state.smoothed == null) return; state.baseline = Math.round(value ?? state.smoothed); $('baseV').textContent = state.baseline + ' bpm'; }
-  function resetCalibration() { state.baseline = null; state.opening = []; state.samples = []; state.smoothed = null; state.firstSampleAt = null; $('baseV').textContent = 'sets after 30 s'; }
+  function setStart() { state.start = Math.round(state.opening.reduce((a, b) => a + b, 0) / state.opening.length); $('startV').textContent = state.start + ' bpm'; }
+  function resetSession() { state.start = null; state.opening = []; state.samples = []; state.smoothed = null; state.firstSampleAt = null; $('startV').textContent = 'average of the first 30 s'; }
 
   // ---------- Pulsoid websocket ----------
   function setStatus(text, cls) { const s = $('status'); s.textContent = text; s.className = 'status' + (cls ? ' ' + cls : ''); }
@@ -176,7 +182,7 @@ select { background: rgba(255,255,255,0.06); color: var(--fg); border: 1px solid
     if (!token) { setStatus('paste a token first', 'bad'); return; }
     try { localStorage.setItem('pulsoid_token', token); } catch (e) {}
     disconnect();
-    if ($('simOn').checked) { $('simOn').checked = false; stopSim(); resetCalibration(); }   // a fake baseline must not carry into a live session
+    if ($('simOn').checked) { $('simOn').checked = false; stopSim(); resetSession(); }   // a fake session must not carry into a live one
     setStatus('connecting…');
     const ws = new WebSocket(`wss://dev.pulsoid.net/api/v1/data/real_time?access_token=${encodeURIComponent(token)}`);
     state.ws = ws;
@@ -192,14 +198,14 @@ select { background: rgba(255,255,255,0.06); color: var(--fg); border: 1px solid
   }
   function disconnect() { if (state.ws) { const w = state.ws; state.ws = null; w.close(1000); } }
 
-  // ---------- simulator ----------
-  function startSim() { disconnect(); setStatus('simulating', 'ok'); tickSim(); if (state.baseline == null) setBaseline(+$('sim').value); state.simTimer = setInterval(tickSim, 1000); }
-  function tickSim() { pushSample(Math.round(+$('sim').value + (Math.random() * 4 - 2)), 'simulated heart rate'); }
+  // ---------- test mode: an exact fake reading, once a second and whenever the slider moves ----------
+  function startSim() { disconnect(); setStatus('simulating', 'ok'); tickSim(); state.simTimer = setInterval(tickSim, 1000); }
+  function tickSim() { pushSample(+$('sim').value, 'simulated heart rate'); }
   function stopSim() { clearInterval(state.simTimer); if (!state.ws) setStatus('not connected'); }
 
   // ---------- canopy drawing ----------
   const canvas = $('canopy'), ctx = canvas.getContext('2d');
-  let lights = [], shownHue = 240, shownT = 1;
+  let lights = [], shownHue = 280, shownT = 0.5;
   function resize() {
     canvas.width = innerWidth * devicePixelRatio; canvas.height = innerHeight * devicePixelRatio;
     ctx.setTransform(devicePixelRatio, 0, 0, devicePixelRatio, 0, 0);
@@ -207,9 +213,10 @@ select { background: rgba(255,255,255,0.06); color: var(--fg); border: 1px solid
     lights = Array.from({ length: n }, () => ({ x: Math.random() * innerWidth, y: Math.random() * innerHeight * 0.7, r: 2 + Math.random() * 2.5, ph: Math.random() * Math.PI * 2, tw: 0.6 + Math.random() * 0.8 }));
   }
   function frame(now) {
-    const t = targetT(); const tt = t == null ? 1 : Math.min(1, t);
+    const t = targetT();
+    if (t != null) state.hue = hueFor(t);                 // re-evaluated every frame so the Tuning sliders apply at once
     shownHue += (((state.hue - shownHue + 540) % 360) - 180) * 0.03;
-    shownT += (tt - shownT) * 0.03;
+    shownT += ((t == null ? 0.5 : t) - shownT) * 0.03;
     const bpm = state.smoothed ?? 70;
     const beat = 0.5 + 0.5 * Math.sin((now / 1000) * (bpm / 60) * 2 * Math.PI);   // the lights breathe at the current heart rate
     const sat = 70, lit = 13 + 5 * shownT;
@@ -229,9 +236,8 @@ select { background: rgba(255,255,255,0.06); color: var(--fg); border: 1px solid
   $('connect').onclick = connect;
   $('token').addEventListener('keydown', e => { if (e.key === 'Enter') connect(); });
   $('simOn').onchange = () => $('simOn').checked ? startSim() : stopSim();
-  $('sim').oninput = () => $('simV').textContent = $('sim').value + ' bpm';
-  $('setBase').onclick = () => setBaseline();
-  $('drop').oninput = () => $('dropV').textContent = $('drop').value;
+  $('sim').oninput = () => { $('simV').textContent = $('sim').value + ' bpm'; if ($('simOn').checked) tickSim(); };
+  $('floor').oninput = $('ceil').oninput = drawSwatches;
   $('smooth').oninput = () => $('smoothV').textContent = $('smooth').value + ' s';
   $('step').oninput = () => $('stepV').textContent = $('step').value + ' bpm';
   $('copyLog').onclick = () => {

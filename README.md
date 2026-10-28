@@ -9,7 +9,7 @@ Live prototype: https://yanmaggie53.github.io/heart-rate-canopy/
 1. Install the Pulsoid app on iPhone and Apple Watch, open it on the watch, and start measuring.
 2. Get a Pulsoid access token (see `docs/pulsoid-token.md`).
 3. Open https://yanmaggie53.github.io/heart-rate-canopy/ (or open `web/index.html` by double-clicking it).
-4. Paste the token, press Connect, sit still for 30 seconds while the baseline sets.
+4. Paste the token, press Connect, and sit still. The canopy runs from purple at 55 bpm to red at 95 bpm (adjustable under Tuning); a slower heart turns it cooler.
 
 No install, no build step. Under Tuning there is a test mode that feeds a fake reading, for checking the colors without a watch.
 
