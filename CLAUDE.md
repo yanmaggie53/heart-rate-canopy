@@ -25,15 +25,15 @@ Two stages:
 - Lights are WS2812B / NeoPixel addressable fairy strings on thin wire, 3-wire (5V, data, ground). Two-wire strings don't work with standard libraries. Separate 5V supply, not the ESP32's USB.
 - Controller is an ESP32 dev board. Use NimBLE-Arduino for Bluetooth (the stock ESP32 BLE library crashes on Polar H10/H9) and FastLED or Adafruit NeoPixel for the lights.
 - Heart rate is mapped to hue continuously, not in bins, with a rolling average over the last 5 to 10 s, because raw values jitter by 2 to 5 bpm even at rest and a stepped palette strobes. A stepped mode (new color every N bpm) stays available as an option to compare.
-- The scale is relative to the sitter. Baseline = average of the first 30 s. Calm target = baseline minus 20 bpm by default. Mapping: t = (hr - (baseline - drop)) / drop, clamped to 0..2, where t=0 is calm, t=1 is baseline and t=2 is one drop above baseline. Before the 30 s are up, the stand-in baseline is the average of all readings so far, never the current reading itself (that pins t at 1 and the color never moves).
-- Color uses the whole wheel, cool when calm and warm when elevated: calm is blue (240), baseline is yellow (60), one drop above baseline is magenta (330). Below baseline hue = 240 - 180·t (blue, cyan, green, yellow over one drop); above it hue = 60 - 90·(t - 1) (orange, red, magenta over one drop). Decided 2026-10-26, replacing an earlier two-hue blue-to-amber palette.
-- Test mode (under Tuning in the web page) feeds a fake reading and pins the baseline to the slider's starting value so the whole range can be seen by dragging. Connecting to Pulsoid turns it off and resets the baseline.
+- The scale is fixed in bpm, not relative to the sitter. Visitors are seated, neither sleeping nor exercising, and mostly students, so a realistic seated range reads the same for everyone and every bpm has its own color. Defaults: floor 55 bpm, ceiling 95 bpm, both adjustable under Tuning. Mapping: t = (hr - floor) / (ceiling - floor), clamped 0..1. Decided 2026-10-27, replacing the per-sitter scale (baseline from the first 30 s, calm target = baseline - 20). The first-30-s average is still kept as "started at", but it only feeds the line under the reading.
+- Color runs down the wheel from purple at the floor (hue 280) through blue, cyan, green, yellow and orange to red at the ceiling (hue 0), continuously: hue = 280·(1 - t). With the default range that is 7 degrees per bpm, so a change of one bpm is a visible shift. Decided 2026-10-27, replacing the blue-to-magenta scale of 2026-10-26.
+- Test mode (under Tuning in the web page) feeds an exact fake reading from a slider, once a second and whenever the slider moves, so each color can be checked without a watch. Connecting to Pulsoid turns it off and starts a fresh session.
 - Lights "breathe" (brightness oscillates) at the current heart rate, so a fast heart reads as flicker and a slow one as breathing. With the H10's beat timing this can become a true per-beat pulse.
 - Heart rate is physiological data. The gallery needs a sign saying it's measured and whether it's stored. Logged data is anonymous (no names, no timestamps that identify a person).
 
 ## Code conventions
 
-- Keep the mapping logic (`targetT`, `hueFor`, smoothing, baseline) separate from presentation. It is the one piece that moves from the web prototype to the ESP32 unchanged in behavior.
+- Keep the mapping logic (`targetT`, `hueFor`, smoothing, floor and ceiling) separate from presentation. It is the one piece that moves from the web prototype to the ESP32 unchanged in behavior.
 - Plain, dependency-free HTML/JS for the web prototype. No build step.
 - Never commit a Pulsoid token. The page keeps it in localStorage only.
 - Firmware in Arduino/PlatformIO C++, with the pin numbers, LED count and supply current written at the top of the sketch.
