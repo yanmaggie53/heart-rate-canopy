@@ -30,6 +30,7 @@ Two stages:
 - Test mode (under Tuning in the web page) feeds an exact fake reading from a slider, once a second and whenever the slider moves, so each color can be checked without a watch. Connecting to Pulsoid turns it off and starts a fresh session.
 - Lights "breathe" (brightness oscillates) at the current heart rate, so a fast heart reads as flicker and a slow one as breathing. With the H10's beat timing this can become a true per-beat pulse.
 - Heart rate is physiological data. The gallery needs a sign saying it's measured and whether it's stored. Logged data is anonymous (no names, no timestamps that identify a person).
+- Look of the web stand-in: the field is pure black and only the fairy lights carry color (a soft halo around each, as through fabric). Type is rounded and soft, all lowercase: Fredoka for the big number and title, Nunito for everything else, with a faint glow in the current light color. Cozy, not sharp. Decided 2026-10-30, replacing the Fraunces + Instrument Sans pairing and the colored background wash.
 
 ## Code conventions
 
