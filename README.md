@@ -6,10 +6,10 @@ Live prototype: https://yanmaggie53.github.io/heart-rate-canopy/
 
 ## Try the prototype
 
-1. Install the Pulsoid app on iPhone and Apple Watch, open it on the watch, and start measuring.
-2. Get a Pulsoid access token (see `docs/pulsoid-token.md`).
-3. Open https://yanmaggie53.github.io/heart-rate-canopy/ (or open `web/index.html` by double-clicking it).
-4. Paste the token, press Connect, and sit still. The canopy runs from purple at 55 bpm to red at 95 bpm (adjustable under Tuning); a slower heart turns it cooler.
+1. Start HeartCast on the iPhone and the watch, start the workout from the watch, and keep HeartCast open on the iPhone screen (or put on the Polar armband).
+2. Open https://yanmaggie53.github.io/heart-rate-canopy/ in Chrome or Edge (or run `python3 -m http.server 8731 --directory web` and open http://localhost:8731).
+3. Press Connect by Bluetooth and pick the HeartCast or Polar device from the list.
+4. Sit still. The canopy runs from purple at 55 bpm to red at 95 bpm (adjustable under Tuning); a slower heart turns it cooler. To use Pulsoid instead, open "Use Pulsoid instead" and paste a token (see `docs/pulsoid-token.md`).
 
 No install, no build step. Under Tuning there is a test mode that feeds a fake reading, for checking the colors without a watch.
 

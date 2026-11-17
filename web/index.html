@@ -7,7 +7,7 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Gaegu&display=swap">
 <style>
-/* Layout: a black field with the fairy lights (the canopy), a large reading, and one small card at the bottom with the two things you need: token and connect. Everything else folds away under "tuning".
+/* Layout: a black field with the fairy lights (the canopy), a large reading, and one small card at the bottom with the one thing you need: connect by bluetooth. Pulsoid and tuning fold away below it.
    Look: the lights are the only color. Type is Gaegu, a handwritten, uneven face, for everything, all lowercase, sizes kept close together, with a faint glow in the current light color. Cozy, not sharp. */
 :root {
   --bg: #000;
@@ -64,6 +64,8 @@ button, input, select { font-family: inherit; text-transform: inherit; }
 input[type=password], input[type=text] { flex: 1; background: rgba(255,255,255,0.06); border: 1px solid var(--line); color: var(--fg); border-radius: 10px; padding: 9px 12px; font: 16px var(--body); }
 button { background: var(--accent); color: #1a1407; border: 0; border-radius: 10px; padding: 9px 16px; font: 400 16px var(--body); cursor: pointer; white-space: nowrap; }
 button.ghost { background: transparent; color: var(--fg); border: 1px solid var(--line); font-weight: 500; }
+button.wide { flex: 1; }
+details > .row { margin-top: 12px; }
 button:focus-visible, input:focus-visible, select:focus-visible, summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 
 .sim { display: flex; align-items: center; gap: 12px; font-size: 15px; color: var(--muted); border-top: 1px dashed var(--line); padding-top: 12px; }
@@ -93,7 +95,7 @@ select { background: rgba(255,255,255,0.06); color: var(--fg); border: 1px solid
 <div class="readout">
   <div class="label" id="srcLabel">waiting for heart rate</div>
   <div class="bpm" id="bpm">--</div>
-  <div class="sub" id="sub">Paste your Pulsoid token below and connect.</div>
+  <div class="sub" id="sub">Start HeartCast on your watch, keep it open on your iPhone, then connect by Bluetooth below.</div>
 </div>
 
 <div class="card">
@@ -103,9 +105,17 @@ select { background: rgba(255,255,255,0.06); color: var(--fg); border: 1px solid
   </div>
 
   <div class="row">
-    <input type="password" id="token" placeholder="Pulsoid access token" autocomplete="off">
-    <button id="connect" type="button">Connect</button>
+    <button id="bleConnect" class="wide" type="button">Connect by Bluetooth</button>
   </div>
+  <p class="hint" id="bleHint">Start the workout in HeartCast on the watch and keep HeartCast open on the iPhone screen (or put on the Polar armband), then pick it from the list. Works in Chrome or Edge.</p>
+
+  <details>
+    <summary>Use Pulsoid instead</summary>
+    <div class="row">
+      <input type="password" id="token" placeholder="Pulsoid access token" autocomplete="off">
+      <button id="connect" class="ghost" type="button">Connect</button>
+    </div>
+  </details>
 
   <details>
     <summary>Tuning</summary>
@@ -125,7 +135,7 @@ select { background: rgba(255,255,255,0.06); color: var(--fg); border: 1px solid
         <input type="range" id="sim" min="45" max="120" value="75">
         <span class="v" id="simV">75 bpm</span>
       </div>
-      <p class="hint">Test mode feeds an exact fake reading so each color can be checked without a watch. Connecting to Pulsoid turns it off.</p>
+      <p class="hint">Test mode feeds an exact fake reading so each color can be checked without a watch. Connecting a live heart rate turns it off.</p>
     </div>
   </details>
 </div>
@@ -133,7 +143,8 @@ select { background: rgba(255,255,255,0.06); color: var(--fg); border: 1px solid
 <script>
 (function () {
   const $ = id => document.getElementById(id);
-  const state = { ws: null, simTimer: null, smoothed: null, start: null, firstSampleAt: null, samples: [], opening: [], log: [], hue: 280 };
+  // source: which live input is in charge ('ble', 'pulsoid', 'sim' or null), so a retry from one never knocks out another
+  const state = { source: null, ws: null, ble: null, bleRetry: null, lastLiveAt: 0, simTimer: null, smoothed: null, start: null, firstSampleAt: null, samples: [], opening: [], log: [], hue: 280 };
 
   // ---------- mapping: a fixed scale in bpm ----------
   // Tuned for people sitting in a gallery, mostly students: purple at the floor (55 bpm by default), red at the ceiling (95).
@@ -179,14 +190,93 @@ select { background: rgba(255,255,255,0.06); color: var(--fg); border: 1px solid
   function setStart() { state.start = Math.round(state.opening.reduce((a, b) => a + b, 0) / state.opening.length); $('startV').textContent = state.start + ' bpm'; }
   function resetSession() { state.start = null; state.opening = []; state.samples = []; state.smoothed = null; state.firstSampleAt = null; $('startV').textContent = 'average of the first 30 s'; }
 
-  // ---------- Pulsoid websocket ----------
   function setStatus(text, cls) { const s = $('status'); s.textContent = text; s.className = 'status' + (cls ? ' ' + cls : ''); }
+  // Hand over to a new live source: drop the others, and end a test-mode session so fake readings don't carry into a real one.
+  function takeOver(source) {
+    disconnectPulsoid(); disconnectBle();
+    if ($('simOn').checked) { $('simOn').checked = false; stopSim(); resetSession(); }
+    state.source = source;
+    state.lastLiveAt = 0;
+  }
+
+  // ---------- Bluetooth heart rate: HeartCast relaying the Apple Watch, or a Polar armband ----------
+  // Uses Web Bluetooth (Chrome and Edge, on https or localhost). Any device offering the standard Heart Rate Service
+  // (0x180D) appears in the browser's chooser; readings arrive as notifications on Heart Rate Measurement (0x2A37),
+  // the same characteristic the ESP32 reads. Byte 0 is flags: bit 0 set means the rate is 16 bits, else 8 bits.
+  function parseHeartRate(dv) {
+    const flags = dv.getUint8(0);
+    return (flags & 0x01) ? dv.getUint16(1, true) : dv.getUint8(1);
+  }
+  function bleProblem() {
+    if (!window.isSecureContext) return 'bluetooth needs the page opened from https or localhost';
+    if (!navigator.bluetooth) return 'this browser has no bluetooth. open the page in chrome or edge';
+    return null;
+  }
+  async function connectBle() {
+    const problem = bleProblem();
+    if (problem) { setStatus(problem, 'bad'); return; }
+    let device;
+    try {
+      device = await navigator.bluetooth.requestDevice({ filters: [{ services: ['heart_rate'] }] });
+    } catch (e) {
+      // The chooser was closed; leave whatever was connected alone. Chrome shows "bluetooth off" and "not allowed"
+      // inside the chooser itself, so those cases also end here as a cancel.
+      if (/cancel/i.test(e.message)) {
+        if (!state.source) setStatus('no device chosen');
+        $('bleHint').textContent = 'If the list stayed empty: keep HeartCast open on the iPhone screen, check Bluetooth is on, and allow Chrome in System Settings → Privacy & Security → Bluetooth.';
+      }
+      else if (/adapter not available/i.test(e.message)) setStatus('this computer has no bluetooth', 'bad');
+      else setStatus('bluetooth: ' + e.message, 'bad');
+      return;
+    }
+    takeOver('ble');
+    state.ble = device;
+    device.ongattserverdisconnected = () => { if (state.ble === device) { setStatus('bluetooth dropped, reconnecting', 'bad'); retryBle(device); } };
+    $('bleConnect').textContent = 'Choose another device';
+    attachBle(device);
+  }
+  async function attachBle(device) {
+    const name = device.name || 'heart rate monitor';
+    setStatus(`connecting to ${name}…`);
+    try {
+      const server = await device.gatt.connect();
+      const ch = await (await server.getPrimaryService('heart_rate')).getCharacteristic('heart_rate_measurement');
+      ch.oncharacteristicvaluechanged = e => {   // a property, not addEventListener, so a reconnect never doubles the handler
+        if (state.ble !== device) return;
+        const hr = parseHeartRate(e.target.value);
+        if (hr > 20 && hr < 250) { state.lastLiveAt = Date.now(); setStatus(`live from ${name}`, 'ok'); pushSample(hr, 'live heart rate'); }
+      };
+      await ch.startNotifications();
+      if (state.ble === device) setStatus(`connected to ${name}, waiting for a reading`, 'ok');
+      else device.gatt.disconnect();   // another source took over while this one was connecting
+    } catch (e) {
+      if (state.ble !== device) return;
+      console.warn('bluetooth:', e.name, e.message);
+      if (/no longer in range/i.test(e.message)) {   // Chrome on macOS forgets a device ~3 min after the chooser last saw it advertise; only a new pick brings it back
+        clearTimeout(state.bleRetry); state.ble = null; state.source = null;
+        $('bleConnect').textContent = 'Connect by Bluetooth';
+        setStatus(`lost ${name}. open heartcast on the iphone, then press connect by bluetooth and pick it again`, 'bad');
+        return;
+      }
+      setStatus(`can't reach ${name}, retrying`, 'bad'); retryBle(device);
+    }
+  }
+  function retryBle(device) {   // retries even while the link is up, in case connecting worked but subscribing didn't
+    clearTimeout(state.bleRetry);
+    state.bleRetry = setTimeout(() => { if (state.ble === device) attachBle(device); }, 5000);
+  }
+  function disconnectBle() {
+    clearTimeout(state.bleRetry);
+    $('bleConnect').textContent = 'Connect by Bluetooth';
+    if (state.ble) { const d = state.ble; state.ble = null; try { d.gatt.disconnect(); } catch (e) {} }
+  }
+
+  // ---------- Pulsoid websocket ----------
   function connect() {
     const token = $('token').value.trim();
     if (!token) { setStatus('paste a token first', 'bad'); return; }
     try { localStorage.setItem('pulsoid_token', token); } catch (e) {}
-    disconnect();
-    if ($('simOn').checked) { $('simOn').checked = false; stopSim(); resetSession(); }   // a fake session must not carry into a live one
+    takeOver('pulsoid');
     setStatus('connecting…');
     const ws = new WebSocket(`wss://dev.pulsoid.net/api/v1/data/real_time?access_token=${encodeURIComponent(token)}`);
     state.ws = ws;
@@ -194,18 +284,18 @@ select { background: rgba(255,255,255,0.06); color: var(--fg); border: 1px solid
     ws.onmessage = ev => {
       let hr = null;
       try { const j = JSON.parse(ev.data); hr = j?.data?.heart_rate ?? j?.heart_rate ?? null; } catch (e) { hr = parseInt(ev.data, 10); }
-      if (hr && hr > 20 && hr < 250) { setStatus('live', 'ok'); pushSample(hr, 'live heart rate'); }
+      if (hr && hr > 20 && hr < 250) { state.lastLiveAt = Date.now(); setStatus('live', 'ok'); pushSample(hr, 'live heart rate'); }
     };
-    ws.onerror = () => setStatus('could not connect. Check the token and that the watch is measuring.', 'bad');
-    ws.onclose = ev => { if (state.ws === ws) { state.ws = null; if (ev.code === 1000) setStatus('not connected'); else { setStatus('connection dropped, retrying', 'bad'); setTimeout(() => { if (!state.ws && !$('simOn').checked) connect(); }, 5000); } } };
+    ws.onerror = () => { if (state.ws === ws) setStatus('could not connect. Check the token and that the watch is measuring.', 'bad'); };
+    ws.onclose = ev => { if (state.ws === ws) { state.ws = null; if (ev.code === 1000) setStatus('not connected'); else { setStatus('connection dropped, retrying', 'bad'); setTimeout(() => { if (state.source === 'pulsoid' && !state.ws) connect(); }, 5000); } } };
     $('connect').textContent = 'Reconnect';
   }
-  function disconnect() { if (state.ws) { const w = state.ws; state.ws = null; w.close(1000); } }
+  function disconnectPulsoid() { if (state.ws) { const w = state.ws; state.ws = null; w.close(1000); } }
 
   // ---------- test mode: an exact fake reading, once a second and whenever the slider moves ----------
-  function startSim() { disconnect(); setStatus('simulating', 'ok'); tickSim(); state.simTimer = setInterval(tickSim, 1000); }
+  function startSim() { disconnectPulsoid(); disconnectBle(); state.source = 'sim'; setStatus('simulating', 'ok'); tickSim(); state.simTimer = setInterval(tickSim, 1000); }
   function tickSim() { pushSample(+$('sim').value, 'simulated heart rate'); }
-  function stopSim() { clearInterval(state.simTimer); if (!state.ws) setStatus('not connected'); }
+  function stopSim() { clearInterval(state.simTimer); if (state.source === 'sim') { state.source = null; setStatus('not connected'); } }
 
   // ---------- canopy drawing ----------
   const canvas = $('canopy'), ctx = canvas.getContext('2d');
@@ -235,6 +325,17 @@ select { background: rgba(255,255,255,0.06); color: var(--fg); border: 1px solid
   }
 
   // ---------- wiring ----------
+  $('bleConnect').onclick = connectBle;
+  { const p = bleProblem(); if (p) $('bleHint').textContent = p + '.'; }   // say up front when this browser can't do it
+  setInterval(() => {   // like STALE_MS in canopy.cpp: a link that is up but silent is not live
+    const up = state.source === 'ble' ? !!(state.ble && state.ble.gatt.connected)
+             : state.source === 'pulsoid' ? !!(state.ws && state.ws.readyState === WebSocket.OPEN) : false;
+    if (up && state.lastLiveAt && Date.now() - state.lastLiveAt > 20000) {
+      state.lastLiveAt = 0;
+      setStatus('connected, but no reading for 20 s. is the workout still running on the watch?', 'bad');
+      $('srcLabel').textContent = 'waiting for heart rate';
+    }
+  }, 1000);
   $('connect').onclick = connect;
   $('token').addEventListener('keydown', e => { if (e.key === 'Enter') connect(); });
   $('simOn').onchange = () => $('simOn').checked ? startSim() : stopSim();
