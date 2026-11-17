@@ -23,6 +23,7 @@
 #include <Arduino.h>
 #include <FastLED.h>
 #include "mapping.h"
+#include "hue_rgb.h"
 
 // ---------- hardware: change these to match the bench ----------
 constexpr int    DATA_PIN     = 4;     // GPIO the string's data wire goes to (pin labeled 4 on the board;
@@ -41,23 +42,6 @@ CRGB leds[NUM_LEDS];
 
 // Counting takes about 4 s whatever the string length (20 ms per light for 200).
 constexpr int COUNT_STEP_MS = (4000 / NUM_LEDS > 10) ? 4000 / NUM_LEDS : 10;
-
-// Full-saturation color for a hue in degrees, on the same wheel as CSS hsl().
-CRGB hueToRgb(float deg) {
-  float h = fmodf(deg, 360) / 60;   // 0..6, one unit per sixth of the wheel
-  if (h < 0) h += 6;
-  float x = 1 - fabsf(fmodf(h, 2) - 1);
-  float r, g, b;
-  switch ((int)h) {
-    case 0:  r = 1; g = x; b = 0; break;   // red -> yellow
-    case 1:  r = x; g = 1; b = 0; break;   // yellow -> green
-    case 2:  r = 0; g = 1; b = x; break;   // green -> cyan
-    case 3:  r = 0; g = x; b = 1; break;   // cyan -> blue
-    case 4:  r = x; g = 0; b = 1; break;   // blue -> magenta
-    default: r = 1; g = 0; b = x; break;   // magenta -> red
-  }
-  return CRGB(r * 255, g * 255, b * 255);
-}
 
 void countLights() {
   Serial.printf("\n1. counting: %d lights should come on one by one, dim white, every tenth one red\n", NUM_LEDS);
