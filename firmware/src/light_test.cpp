@@ -6,8 +6,15 @@
 //   2. Color order. The whole string goes red, then green, then blue, 2 s each. If the colors come out
 //      in a different order, change COLOR_ORDER below (most fairy strings are GRB, RGB or BGR;
 //      watch which color comes FIRST, since a wrong order still cycles through all three).
-//   3. The canopy palette. A slow sweep from purple (55 bpm) to red (95 bpm) and back, using the same
-//      mapping as the web page (include/mapping.h). The monitor prints the bpm each color stands for.
+//   3. The canopy palette, dimming and warming. The string does what it does for a sitter whose heart
+//      slows: full brightness and pale warm white at RISE_BPM above a pretend start of 75 bpm, down to the
+//      dimmest, deepest ember at CALM_DROP below it, and back up, using the same mapping as the web page
+//      (include/mapping.h) and the warm gradient in include/palette.h, each light a little apart from the
+//      others on it, at the canopy's average breath and twinkle. The monitor prints the level for each bpm
+//      and says when SUPPLY_MA is holding the string back (then the top end stops getting brighter).
+//      This is for checking the colors; judge how dim the calm end is in the canopy sketch itself, which
+//      breathes with the cue: type 75 in its serial monitor, wait 30 s, then type 63. If the calm end doesn't read as a
+//      warm glow through the fabric, raise DIM_FLOOR (or BRIGHTNESS, once SUPPLY_MA is set from the adapter).
 //
 // Wiring for a 3-wire WS2812B fairy string:
 //   string 5V    -> + of the separate 5V supply (not the ESP32's 5V pin)
@@ -24,7 +31,7 @@
 #include <Arduino.h>
 #include <FastLED.h>
 #include "mapping.h"
-#include "hue_rgb.h"
+#include "palette.h"
 
 // ---------- hardware: change these to match the bench ----------
 constexpr int    DATA_PIN     = 4;     // GPIO the string's data wire goes to (pin labeled 4 on the board;
@@ -42,6 +49,7 @@ constexpr int    SUPPLY_MA    = 1000;  // FastLED's current limit in mA; it dims
 constexpr int    BRIGHTNESS   = 80;    // 0..255. Low until the wiring is proven.
 
 CRGB leds[NUM_LEDS];
+float paletteOffset[NUM_LEDS];   // how far ahead of or behind the others each light sits on the gradient (-1..1)
 
 // Counting takes about 4 s whatever the string length (20 ms per light for 200).
 constexpr int COUNT_STEP_MS = (4000 / NUM_LEDS > 10) ? 4000 / NUM_LEDS : 10;
@@ -72,20 +80,35 @@ void colorOrder() {
   Serial.println("   wrong order? change COLOR_ORDER at the top of light_test.cpp (red showing green and blue showing red means BGR)");
 }
 
-// Sweep the canopy palette between two whole-number heart rates in tenths of a bpm, about 10 s
-// each way. Prints the hue at every whole bpm, so the list can be checked against the web page.
-constexpr int STEPS_PER_BPM = 10;
+// Dim and warm the string between two whole-number heart rates in tenths of a bpm, about 10 s each way, as the
+// canopy would for a sitter who started at START_BPM: the same colors (decoded for the LEDs) and the same average
+// brightness, but without the breathing, twinkle and easing. Like the canopy, it works out the supply limit for the
+// top of a breath and applies it evenly, and says when that is holding the canopy back. Prints the level at every whole bpm.
+constexpr int   STEPS_PER_BPM = 10;
+constexpr float START_BPM = 75;
 
 void sweep(int fromBpm, int toBpm) {
   const int dir = toBpm > fromBpm ? 1 : -1;
   const int steps = abs(toBpm - fromBpm) * STEPS_PER_BPM;
+  const int stepMs = 10000 / steps;
   for (int i = 0; i <= steps; i++) {
     const float bpm = fromBpm + dir * (float)i / STEPS_PER_BPM;
-    const float hue = hueFor(targetT(bpm));
-    fill_solid(leds, NUM_LEDS, hueToRgb(hue));
-    FastLED.show();
-    if (i % STEPS_PER_BPM == 0) Serial.printf("   %3.0f bpm  hue %3.0f\n", bpm, hue);
-    delay(25);
+    const float t = levelT(bpm, START_BPM), level = levelFor(t);
+    auto fill = [&](float breathSwell) {
+      const float a = level * breathSwell * twinkleFor(0, t);
+      for (int j = 0; j < NUM_LEDS; j++) {
+        const CRGB c = ledColor(PALETTES[CANOPY_PALETTE], lightPos(t, paletteOffset[j]));
+        leds[j] = CRGB(lroundf(c.r * a), lroundf(c.g * a), lroundf(c.b * a));
+      }
+    };
+    fill(swellFor(1));   // the top of a breath, to work out the supply limit as the canopy does
+    const uint8_t scale = calculate_max_brightness_for_power_mW(BRIGHTNESS, (uint32_t)SUPPLY_VOLTS * SUPPLY_MA);
+    fill(swellFor(0.5f));   // then the canopy's average over a breath and a twinkle
+    FastLED.show(scale);
+    if (i % STEPS_PER_BPM == 0)
+      Serial.printf("   %3.0f bpm  (%+3.0f from the start)  level %.2f%s\n", bpm, bpm - START_BPM, level,
+                    scale < BRIGHTNESS ? "  (held back by SUPPLY_MA)" : "");
+    delay(stepMs);
   }
 }
 
@@ -95,7 +118,9 @@ void setup() {
   FastLED.addLeds<WS2812B, DATA_PIN, COLOR_ORDER>(leds, NUM_LEDS);
   FastLED.setMaxPowerInVoltsAndMilliamps(SUPPLY_VOLTS, SUPPLY_MA);
   FastLED.setBrightness(BRIGHTNESS);
+  FastLED.setDither(DISABLE_DITHER);   // so the supply estimate in sweep() counts the same thing as show()
   FastLED.clear(true);
+  for (int i = 0; i < NUM_LEDS; i++) paletteOffset[i] = random8() / 127.5f - 1;
   Serial.printf("\nlight test: %d lights on GPIO %d, brightness %d/255, supply limit %d mA\n",
                 NUM_LEDS, DATA_PIN, BRIGHTNESS, SUPPLY_MA);
 }
@@ -103,7 +128,9 @@ void setup() {
 void loop() {
   countLights();
   colorOrder();
-  Serial.printf("\n3. canopy palette: purple at %.0f bpm up to red at %.0f bpm, then back down\n", FLOOR_BPM, CEIL_BPM);
-  sweep((int)FLOOR_BPM, (int)CEIL_BPM);
-  sweep((int)CEIL_BPM, (int)FLOOR_BPM);
+  const int hi = START_BPM + RISE_BPM, lo = START_BPM - CALM_DROP;
+  Serial.printf("\n3. canopy palette (%s), dimming and warming as a heart slows from %d to %d bpm (started at %.0f), then back up\n",
+                PALETTES[CANOPY_PALETTE].name, hi, lo, START_BPM);
+  sweep(hi, lo);
+  sweep(lo, hi);
 }
