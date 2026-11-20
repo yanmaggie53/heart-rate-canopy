@@ -1,11 +1,14 @@
 // The canopy: reads a heart rate monitor over Bluetooth and colors the fairy lights with it.
 //
-// Heart rate source: any Bluetooth device offering the standard Heart Rate Service (0x180D), which is
-// what a Polar Verity Sense or H10 broadcasts, and also what an iPhone app such as HeartCast or
-// HR Broadcast puts out when it relays the Apple Watch's reading. The ESP32 scans for the first such
-// device (or one whose name starts with TARGET_NAME if that is set), connects, subscribes to the Heart
-// Rate Measurement characteristic (0x2A37) and gets a reading every time the sensor sends one. If the
-// connection drops it starts scanning again.
+// Heart rate source: the COOSPO HW807 optical armband (confirmed 2026-11-20, a reading every second).
+// It offers the standard Heart Rate Service (0x180D), like a Polar Verity Sense or H10, or an iPhone app
+// such as HeartCast relaying the Apple Watch. The ESP32 scans for a device with that service whose name
+// starts with TARGET_NAME ("" = the first one heard), connects, subscribes to the Heart Rate Measurement
+// characteristic (0x2A37) and gets a reading every time the sensor sends one. If the connection drops,
+// or the armband is switched off, it starts scanning again and picks it up when it comes back.
+// If the sensor says it has lost skin contact (taken off the arm), its readings are ignored, so the
+// lights go back to the waiting look instead of showing a made-up number. (The HW807 doesn't report
+// skin contact, so this is for sensors that do.)
 //
 // Color: the same fixed scale as the web page (include/mapping.h), purple at 55 bpm through blue, cyan,
 // green, yellow and orange to red at 95, following a rolling average of the last 5 s of readings. The
@@ -32,7 +35,8 @@
 // ---------- hardware: change these to match the bench ----------
 constexpr int    DATA_PIN     = 4;     // GPIO the string's data wire goes to (never 35, 36 or 37 on a WROOM-2)
 constexpr int    NUM_LEDS     = 200;   // lights on the string
-constexpr EOrder COLOR_ORDER  = GRB;   // confirmed on the canopy string 2026-11-10
+constexpr EOrder COLOR_ORDER  = BGR;   // checked on the canopy string 2026-11-20: with GRB, red showed green and
+                                       // blue showed red (so cyan showed pink). Not GRB as noted on 2026-11-10.
 constexpr int    SUPPLY_VOLTS = 5;
 constexpr int    SUPPLY_MA    = 1000;  // FastLED's current limit in mA. Set to about two thirds of the adapter's
                                        // rating (FastLED counts ~43 mA per white light, real ones draw ~60).
@@ -40,7 +44,9 @@ constexpr int    SUPPLY_MA    = 1000;  // FastLED's current limit in mA. Set to 
 constexpr int    BRIGHTNESS   = 80;    // 0..255 overall cap. Low until the wiring is proven.
 
 // ---------- heart rate monitor ----------
-const char*   TARGET_NAME = "";        // "" = first device with the Heart Rate Service; "Polar" = only Polars, etc.
+const char*   TARGET_NAME = "COOSPO";  // only connect to a device whose name starts with this, so the canopy never
+                                       // grabs a phone running HeartCast or a visitor's own sensor.
+                                       // "" = first device with the Heart Rate Service; "Polar" = only Polars, etc.
 constexpr unsigned long STALE_MS = 20000;  // no reading for this long -> back to the waiting look
 
 // ---------- look ----------
@@ -68,11 +74,15 @@ unsigned long lastTestMs = 0;
 // never inside a callback.
 enum class BleState { Scanning, FoundDevice, Connecting, Connected };
 volatile BleState bleState = BleState::Scanning;
-const NimBLEAdvertisedDevice* foundDevice = nullptr;
+NimBLEAddress foundAddress;               // a copy, not a pointer into the scan results, which a scan restart clears
 NimBLEClient* client = nullptr;
 char deviceName[32] = "";
 volatile int  devicesSeen = 0;            // every advertisement the scan has heard, heart rate or not
-constexpr unsigned long SCAN_REPORT_MS = 20000;  // while scanning, say so this often
+constexpr unsigned long SCAN_REPORT_MS = 20000;  // while scanning, say so this often, and start the scan afresh
+                                                 // (a device whose name was missed once is otherwise never
+                                                 // reported again)
+volatile bool firstReading = true;        // first notification since connecting: say what the sensor can tell us
+volatile int  contactState = -1;          // -1 unknown/not reported, 0 off the skin, 1 on the skin
 
 // ----- one reading in -----
 void onHeartRate(int hr, const char* source) {
@@ -85,13 +95,28 @@ void onHeartRate(int hr, const char* source) {
 }
 
 // Heart Rate Measurement: flags byte, then the rate as one byte (or two, little-endian, if flags bit 0 is set),
-// then optional energy and RR intervals we don't use yet.
+// then optional energy and RR intervals (beat-to-beat timing) we don't use yet.
+// Flags bit 2 = the sensor can tell whether it touches skin, bit 1 = it does. Bit 4 = RR intervals included.
 void onNotify(NimBLERemoteCharacteristic* chr, uint8_t* data, size_t len, bool isNotify) {
   if (len < 2) return;
   const uint8_t flags = data[0];
   int hr;
   if (flags & 0x01) { if (len < 3) return; hr = data[1] | (data[2] << 8); }
   else hr = data[1];
+  const bool canTellContact = flags & 0x04;
+  const int  contact = canTellContact ? ((flags & 0x02) ? 1 : 0) : -1;
+  if (firstReading) {
+    firstReading = false;
+    Serial.printf("%s: %s, %s\n", deviceName,
+                  canTellContact ? "tells whether it touches skin" : "doesn't say whether it touches skin",
+                  (flags & 0x10) ? "sends beat timing" : "no beat timing");
+  }
+  if (contact != contactState) {
+    if (contact == 0) Serial.printf("%s is off the skin: ignoring its readings\n", deviceName);
+    else if (contact == 1 && contactState == 0) Serial.printf("%s is back on the skin\n", deviceName);
+    contactState = contact;
+  }
+  if (contact == 0) return;                // taken off the arm: whatever number it sends isn't a heart rate
   if (hr <= 20 || hr >= 250) return;       // not a real reading (0 is "sensor not on skin")
   if (testBpm > 0) { Serial.printf("(bluetooth hr %d ignored: test mode, type live to use it)\n", hr); return; }
   onHeartRate(hr, deviceName);
@@ -110,7 +135,9 @@ class ScanCallbacks : public NimBLEScanCallbacks {
     }
     snprintf(deviceName, sizeof deviceName, "%s", name.empty() ? "heart rate monitor" : name.c_str());
     Serial.printf("found %s (%s), signal %d dBm\n", deviceName, dev->getAddress().toString().c_str(), dev->getRSSI());
-    foundDevice = dev;
+    firstReading = true;
+    contactState = -1;
+    foundAddress = dev->getAddress();
     bleState = BleState::FoundDevice;
     NimBLEDevice::getScan()->stop();
   }
@@ -152,7 +179,7 @@ void connectToFound() {
     client->setConnectionParams(12, 12, 0, 150);   // 15 ms interval, 1.5 s supervision timeout
     client->setConnectTimeout(5000);
   }
-  bool ok = client->connect(foundDevice);
+  bool ok = client->connect(foundAddress);
   NimBLERemoteService* svc = ok ? client->getService(HR_SERVICE) : nullptr;
   NimBLERemoteCharacteristic* chr = svc ? svc->getCharacteristic(HR_MEASUREMENT) : nullptr;
   if (!chr || !chr->canNotify() || !chr->subscribe(true, onNotify)) {
@@ -251,7 +278,9 @@ void loop() {
   if (bleState == BleState::FoundDevice) connectToFound();
   if (bleState == BleState::Scanning && millis() - lastScanReport >= SCAN_REPORT_MS) {
     lastScanReport = millis();
-    Serial.printf("still looking for a heart rate monitor (%d bluetooth signals heard so far, none from one)\n", (int)devicesSeen);
+    Serial.printf("still looking for a heart rate monitor%s%s (%d bluetooth signals heard so far). "
+                  "is it switched on?\n", TARGET_NAME[0] ? " named " : "", TARGET_NAME, (int)devicesSeen);
+    NimBLEDevice::getScan()->start(0, false, true);   // forget what was heard and listen afresh
   }
   readSerialCommands();
   const unsigned long now = millis();

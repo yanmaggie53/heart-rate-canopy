@@ -4,7 +4,8 @@
 //   1. Counting. Lights come on one at a time, dim white with every tenth one red, so you can check
 //      that NUM_LEDS matches the string and the signal reaches the far end.
 //   2. Color order. The whole string goes red, then green, then blue, 2 s each. If the colors come out
-//      in a different order, change COLOR_ORDER below (most fairy strings are GRB or RGB).
+//      in a different order, change COLOR_ORDER below (most fairy strings are GRB, RGB or BGR;
+//      watch which color comes FIRST, since a wrong order still cycles through all three).
 //   3. The canopy palette. A slow sweep from purple (55 bpm) to red (95 bpm) and back, using the same
 //      mapping as the web page (include/mapping.h). The monitor prints the bpm each color stands for.
 //
@@ -29,7 +30,9 @@
 constexpr int    DATA_PIN     = 4;     // GPIO the string's data wire goes to (pin labeled 4 on the board;
                                        // on a WROOM-2 never use 35, 36 or 37)
 constexpr int    NUM_LEDS     = 200;   // lights on the string (the canopy string has 200)
-constexpr EOrder COLOR_ORDER  = GRB;   // confirmed on the canopy string 2026-11-10 (red, green, blue in order)
+constexpr EOrder COLOR_ORDER  = BGR;   // checked on the canopy string 2026-11-20 by sending pure red (showed green with
+                                       // GRB) and pure blue (showed red). The 2026-11-10 note of GRB was a misread:
+                                       // with GRB the stage below shows green, blue, red, which also looks like a cycle.
 constexpr int    SUPPLY_VOLTS = 5;
 constexpr int    SUPPLY_MA    = 1000;  // FastLED's current limit in mA; it dims the whole string to stay
                                        // under it. FastLED estimates ~43 mA per light at full white but
@@ -66,7 +69,7 @@ void colorOrder() {
     FastLED.show();
     delay(2000);
   }
-  Serial.println("   wrong order? change COLOR_ORDER at the top of light_test.cpp (GRB <-> RGB fixes most strings)");
+  Serial.println("   wrong order? change COLOR_ORDER at the top of light_test.cpp (red showing green and blue showing red means BGR)");
 }
 
 // Sweep the canopy palette between two whole-number heart rates in tenths of a bpm, about 10 s
