@@ -183,7 +183,9 @@ select { background: rgba(255,255,255,0.06); color: var(--fg); border: 1px solid
   const dimFloor = () => +$('dimFloor').value / 100;
   const clamp01 = x => Math.max(0, Math.min(1, x));
   const mean = a => a.reduce((s, x) => s + x, 0) / a.length;
-  const startRate = () => state.start ?? (state.opening.length ? mean(state.opening) : null);
+  // The canopy board sends its own start with each relayed reading (relayStart); when it does, that is the start, so the page
+  // and the lights measure from the same point even if the page connected partway through a sitter.
+  const startRate = () => state.relayStart ?? state.start ?? (state.opening.length ? mean(state.opening) : null);
   const levelT = (hr, start) => clamp01((hr - (start - calmDrop())) / (calmDrop() + riseBpm()));
   const levelFor = t => dimFloor() + (1 - dimFloor()) * clamp01(t);
   function targetLevel() {
@@ -239,15 +241,16 @@ select { background: rgba(255,255,255,0.06); color: var(--fg); border: 1px solid
     state.log.push(`${new Date(now).toISOString().slice(11, 19)},${hr},${state.smoothed.toFixed(1)},${startRate().toFixed(1)},${targetLevel().toFixed(2)}`);
     $('bpm').textContent = Math.round(hr);
     $('srcLabel').textContent = source;
+    if (state.relayStart != null) $('startV').textContent = Math.round(state.relayStart) + ' bpm (from the canopy board)';
     if (state.start == null) { $('sub').textContent = 'Breathe in as the lights swell, out as they fade. As your heart slows, the canopy dims and warms.'; }
     else {
-      const d = Math.round(state.smoothed - state.start);
+      const d = Math.round(state.smoothed - startRate());
       $('sub').textContent = d <= -1 ? `${-d} bpm lower than when you sat down.` : d >= 1 ? `${d} bpm higher than when you sat down.` : 'Same as when you sat down.';
     }
   }
-  function setStart() { state.start = Math.round(state.opening.reduce((a, b) => a + b, 0) / state.opening.length); $('startV').textContent = state.start + ' bpm'; }
+  function setStart() { state.start = Math.round(state.opening.reduce((a, b) => a + b, 0) / state.opening.length); if (state.relayStart == null) $('startV').textContent = state.start + ' bpm'; }
   function resetSession() {   // a new sitter: forget the last one, back to the waiting look
-    state.start = null; state.opening = []; state.samples = []; state.smoothed = null; state.firstSampleAt = null;
+    state.start = null; state.relayStart = null; state.opening = []; state.samples = []; state.smoothed = null; state.firstSampleAt = null;
     $('startV').textContent = 'average of the first 30 s';
     $('bpm').textContent = '--'; $('srcLabel').textContent = 'waiting for heart rate'; $('sub').textContent = WAITING_SUB;
   }
@@ -274,7 +277,9 @@ select { background: rgba(255,255,255,0.06); color: var(--fg); border: 1px solid
     const flags = dv.getUint8(0);
     const hr = (flags & 0x01) ? dv.getUint16(1, true) : dv.getUint8(1);
     const contact = (flags & 0x04) ? !!(flags & 0x02) : null;   // null: this sensor can't tell
-    return { hr, contact };
+    const at = (flags & 0x01) ? 3 : 2;   // Energy Expended (flags bit 3) follows the rate; the canopy board puts its start there, x10
+    const energy = (flags & 0x08) && dv.byteLength >= at + 2 ? dv.getUint16(at, true) : null;
+    return { hr, contact, energy };
   }
   function nobodyThere(name) {   // the canopy board (or a sensor off the skin) says nobody is there
     state.lastLiveAt = 0;
@@ -324,7 +329,11 @@ select { background: rgba(255,255,255,0.06); color: var(--fg); border: 1px solid
         // Rate 0 with contact "no" is the canopy board saying nobody is there. A sensor briefly off the skin
         // (contact "no" with a rate) is just a missing reading, as in canopy.cpp.
         if (contact === false) { if (hr === 0) nobodyThere(name); return; }
-        if (hr > 20 && hr < 250) { noteLive(); setStatus(`live from ${name}`, 'ok'); pushSample(hr, 'live heart rate'); }
+        if (hr > 20 && hr < 250) {
+          // only the canopy board's relay uses the energy field for its start; from a real sensor it would be energy
+          if (/^canopy/i.test(name) && r.energy) state.relayStart = r.energy / 10;
+          noteLive(); setStatus(`live from ${name}`, 'ok'); pushSample(hr, 'live heart rate');
+        }
       };
       await ch.startNotifications();
       if (state.ble === device) setStatus(`connected to ${name}, waiting for a reading`, 'ok');

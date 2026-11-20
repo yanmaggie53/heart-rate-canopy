@@ -24,10 +24,11 @@
 //
 // Relay to the web page: the HW807 takes one Bluetooth connection at a time, so while the board holds it
 // the web page can't read it. So the board also advertises a heart rate signal of its own, named
-// RELAY_NAME ("Canopy"), and passes on every reading the lights use. The web page connects to it exactly
-// as it would to the armband. Between readings, while the lights show the waiting look, it sends
-// "nobody there" (skin contact supported but not detected, rate 0) every 2 s, so the page shows its waiting
-// look too. Turn it off with RELAY_TO_WEB = false: while on, anyone nearby with a Bluetooth app can read
+// RELAY_NAME ("Canopy"), and passes on every reading the lights use, with where this sitter started, so the
+// page dims and warms from the same start as the lights even if it connects partway through. The web page
+// connects to it exactly as it would to the armband. Whenever a new sitter starts, and every 2 s while the
+// lights show the waiting look, it sends "nobody there" (skin contact supported but not detected, rate 0), so
+// the page starts afresh and shows its waiting look too. Turn it off with RELAY_TO_WEB = false: while on, anyone nearby with a Bluetooth app can read
 // the sitter's heart rate, the same as they could read the armband itself.
 //
 // Who is sitting there: the HW807 can't tell when it's off the arm. Taken off and left switched on, it keeps
@@ -168,8 +169,10 @@ bool isLive(unsigned long now) {
   return seatOk && lastReadingMs && now - lastReadingMs < staleMs() && smoother.hasValue();
 }
 
-// Forget the last sitter: the next reading starts afresh.
-void newSitter() { smoother.reset(); startRate.reset(); lastReadingMs = 0; }
+void relay(int hr, bool present);
+// Forget the last sitter: the next reading starts afresh. The web page is told at once ("nobody there"), so it
+// starts its new session from the same reading as the lights, whatever caused this (loop() only).
+void newSitter() { smoother.reset(); startRate.reset(); lastReadingMs = 0; relay(0, false); }
 
 void updateSeat(unsigned long now) {
   if (!hasSeat()) return;
@@ -186,10 +189,19 @@ void updateSeat(unsigned long now) {
 // ----- relay to the web page -----
 // Heart Rate Measurement as the web page reads it: flags (bit 2 = can tell contact, bit 1 = someone is there),
 // then the rate as one byte.
+// With a reading it also carries where this sitter started (tenths of a bpm) in the Energy Expended field (flags bit 3),
+// so a page that connects partway through measures brightness and warmth from the same start as the lights. The page
+// reads that field only from a device named Canopy; anything else reading it would see it as energy.
 void relay(int hr, bool present) {
   if (!relayChr) return;
-  const uint8_t v[2] = { (uint8_t)(0x04 | (present ? 0x02 : 0)), (uint8_t)(present ? hr : 0) };
-  relayChr->notify(v, sizeof v);   // sends these bytes as they are (setValue + notify() could race the NimBLE task)
+  if (!present) {
+    const uint8_t v[2] = { 0x04, 0 };
+    relayChr->notify(v, sizeof v);   // sends these bytes as they are (setValue + notify() could race the NimBLE task)
+    return;
+  }
+  const uint16_t start = startRate.hasValue() ? (uint16_t)lroundf(startRate.value() * 10) : 0;
+  const uint8_t v[4] = { 0x04 | 0x02 | 0x08, (uint8_t)hr, (uint8_t)(start & 0xFF), (uint8_t)(start >> 8) };
+  relayChr->notify(v, sizeof v);
 }
 
 class ServerCallbacks : public NimBLEServerCallbacks {
