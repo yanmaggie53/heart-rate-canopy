@@ -95,7 +95,7 @@ select { background: rgba(255,255,255,0.06); color: var(--fg); border: 1px solid
 <div class="readout">
   <div class="label" id="srcLabel">waiting for heart rate</div>
   <div class="bpm" id="bpm">--</div>
-  <div class="sub" id="sub">Start HeartCast on your watch, keep it open on your iPhone, then connect by Bluetooth below.</div>
+  <div class="sub" id="sub">Put on the armband and power the canopy board, then connect by Bluetooth below and pick Canopy.</div>
 </div>
 
 <div class="card">
@@ -107,7 +107,7 @@ select { background: rgba(255,255,255,0.06); color: var(--fg); border: 1px solid
   <div class="row">
     <button id="bleConnect" class="wide" type="button">Connect by Bluetooth</button>
   </div>
-  <p class="hint" id="bleHint">Start the workout in HeartCast on the watch and keep HeartCast open on the iPhone screen (or put on the Polar armband), then pick it from the list. Works in Chrome or Edge.</p>
+  <p class="hint" id="bleHint">The canopy board shows up as Canopy and passes on the armband's heart rate, so the page and the lights show the same reading. Without the board, pick the armband itself (COOSPO) or HeartCast. Works in Chrome or Edge.</p>
 
   <details>
     <summary>Use Pulsoid instead</summary>
@@ -144,7 +144,25 @@ select { background: rgba(255,255,255,0.06); color: var(--fg); border: 1px solid
 (function () {
   const $ = id => document.getElementById(id);
   // source: which live input is in charge ('ble', 'pulsoid', 'sim' or null), so a retry from one never knocks out another
-  const state = { source: null, ws: null, ble: null, bleRetry: null, lastLiveAt: 0, simTimer: null, smoothed: null, start: null, firstSampleAt: null, samples: [], opening: [], log: [], hue: 280 };
+  const state = { source: null, ws: null, ble: null, bleRetry: null, lastLiveAt: 0, prevLiveAt: 0, gapMs: 0, tellsPresence: false, simTimer: null, smoothed: null, start: null, firstSampleAt: null, samples: [], opening: [], log: [], hue: 280 };
+  const WAITING_SUB = 'Sit down and put on the armband. The canopy wakes when your heart rate comes in.';
+
+  // ---------- who is there (as in canopy.cpp) ----------
+  // A reading counts as missing after a few of the source's usual gaps: 6 s for the armband (a reading a second),
+  // up to 20 s for HeartCast (every ~5 s). Then the canopy goes back to its waiting look and the next reading
+  // starts a new sitter. The HW807 armband can't tell when it's off the arm, so the canopy board (with a seat
+  // sensor, or "sit"/"leave" typed into its serial monitor) says "nobody there" with the skin-contact bits instead.
+  // A source that says who is there (the board does) is trusted for that, and plain silence from it waits the full
+  // 20 s, as the board itself does while its link to the armband is down.
+  const STALE_MIN_MS = 6000, STALE_MAX_MS = 20000, STALE_GAPS = 4;
+  const staleMs = () => state.tellsPresence ? STALE_MAX_MS
+    : state.gapMs > 0 ? Math.min(STALE_MAX_MS, Math.max(STALE_MIN_MS, STALE_GAPS * state.gapMs)) : STALE_MIN_MS;
+  function noteLive() {   // a live reading came in: learn the source's usual gap, ignoring long silences
+    const now = Date.now();
+    if (state.prevLiveAt) { const gap = now - state.prevLiveAt; if (gap <= STALE_MAX_MS) state.gapMs = state.gapMs > 0 ? state.gapMs * 0.8 + gap * 0.2 : gap; }
+    state.prevLiveAt = now;   // kept apart from lastLiveAt, which the stale check clears
+    state.lastLiveAt = now;
+  }
 
   // ---------- mapping: a fixed scale in bpm ----------
   // Tuned for people sitting in a gallery, mostly students: purple at the floor (55 bpm by default), red at the ceiling (95).
@@ -188,24 +206,40 @@ select { background: rgba(255,255,255,0.06); color: var(--fg); border: 1px solid
     }
   }
   function setStart() { state.start = Math.round(state.opening.reduce((a, b) => a + b, 0) / state.opening.length); $('startV').textContent = state.start + ' bpm'; }
-  function resetSession() { state.start = null; state.opening = []; state.samples = []; state.smoothed = null; state.firstSampleAt = null; $('startV').textContent = 'average of the first 30 s'; }
+  function resetSession() {   // a new sitter: forget the last one, back to the waiting look
+    state.start = null; state.opening = []; state.samples = []; state.smoothed = null; state.firstSampleAt = null;
+    $('startV').textContent = 'average of the first 30 s';
+    $('bpm').textContent = '--'; $('srcLabel').textContent = 'waiting for heart rate'; $('sub').textContent = WAITING_SUB;
+  }
 
   function setStatus(text, cls) { const s = $('status'); s.textContent = text; s.className = 'status' + (cls ? ' ' + cls : ''); }
   // Hand over to a new live source: drop the others, and end a test-mode session so fake readings don't carry into a real one.
   function takeOver(source) {
     disconnectPulsoid(); disconnectBle();
-    if ($('simOn').checked) { $('simOn').checked = false; stopSim(); resetSession(); }
+    if ($('simOn').checked) { $('simOn').checked = false; stopSim(); }
+    resetSession();   // the last source's sitter doesn't carry over, even if the new one never sends
     state.source = source;
-    state.lastLiveAt = 0;
+    state.lastLiveAt = 0; state.prevLiveAt = 0; state.gapMs = 0; state.tellsPresence = false;   // a new source may differ
   }
 
-  // ---------- Bluetooth heart rate: HeartCast relaying the Apple Watch, or a Polar armband ----------
+  // ---------- Bluetooth heart rate: the canopy board passing on the armband, the armband itself, or HeartCast ----------
   // Uses Web Bluetooth (Chrome and Edge, on https or localhost). Any device offering the standard Heart Rate Service
   // (0x180D) appears in the browser's chooser; readings arrive as notifications on Heart Rate Measurement (0x2A37),
-  // the same characteristic the ESP32 reads. Byte 0 is flags: bit 0 set means the rate is 16 bits, else 8 bits.
+  // the same characteristic the ESP32 reads. The HW807 armband takes one connection at a time, so while the canopy
+  // board holds it, the board's own relay ("Canopy") is what the chooser lists.
+  // Byte 0 is flags: bit 0 set means the rate is 16 bits, else 8 bits; bit 2 set means the sensor can tell whether
+  // someone is there (skin contact), and then bit 1 says whether they are.
   function parseHeartRate(dv) {
+    if (dv.byteLength < 2 || ((dv.getUint8(0) & 0x01) && dv.byteLength < 3)) return null;   // too short to be a reading
     const flags = dv.getUint8(0);
-    return (flags & 0x01) ? dv.getUint16(1, true) : dv.getUint8(1);
+    const hr = (flags & 0x01) ? dv.getUint16(1, true) : dv.getUint8(1);
+    const contact = (flags & 0x04) ? !!(flags & 0x02) : null;   // null: this sensor can't tell
+    return { hr, contact };
+  }
+  function nobodyThere(name) {   // the canopy board (or a sensor off the skin) says nobody is there
+    state.lastLiveAt = 0;
+    if (state.smoothed != null) resetSession();
+    setStatus(`connected to ${name}, waiting for a heart rate`, 'ok');
   }
   function bleProblem() {
     if (!window.isSecureContext) return 'bluetooth needs the page opened from https or localhost';
@@ -223,7 +257,7 @@ select { background: rgba(255,255,255,0.06); color: var(--fg); border: 1px solid
       // inside the chooser itself, so those cases also end here as a cancel.
       if (/cancel/i.test(e.message)) {
         if (!state.source) setStatus('no device chosen');
-        $('bleHint').textContent = 'If the list stayed empty: keep HeartCast open on the iPhone screen, check Bluetooth is on, and allow Chrome in System Settings → Privacy & Security → Bluetooth.';
+        $('bleHint').textContent = 'If the list stayed empty: check the canopy board is powered (it shows up as Canopy) or the armband is switched on and not already held by the board, check Bluetooth is on, and allow Chrome in System Settings → Privacy & Security → Bluetooth.';
       }
       else if (/adapter not available/i.test(e.message)) setStatus('this computer has no bluetooth', 'bad');
       else setStatus('bluetooth: ' + e.message, 'bad');
@@ -243,8 +277,14 @@ select { background: rgba(255,255,255,0.06); color: var(--fg); border: 1px solid
       const ch = await (await server.getPrimaryService('heart_rate')).getCharacteristic('heart_rate_measurement');
       ch.oncharacteristicvaluechanged = e => {   // a property, not addEventListener, so a reconnect never doubles the handler
         if (state.ble !== device) return;
-        const hr = parseHeartRate(e.target.value);
-        if (hr > 20 && hr < 250) { state.lastLiveAt = Date.now(); setStatus(`live from ${name}`, 'ok'); pushSample(hr, 'live heart rate'); }
+        const r = parseHeartRate(e.target.value);
+        if (!r) return;
+        const { hr, contact } = r;
+        if (contact !== null) state.tellsPresence = true;
+        // Rate 0 with contact "no" is the canopy board saying nobody is there. A sensor briefly off the skin
+        // (contact "no" with a rate) is just a missing reading, as in canopy.cpp.
+        if (contact === false) { if (hr === 0) nobodyThere(name); return; }
+        if (hr > 20 && hr < 250) { noteLive(); setStatus(`live from ${name}`, 'ok'); pushSample(hr, 'live heart rate'); }
       };
       await ch.startNotifications();
       if (state.ble === device) setStatus(`connected to ${name}, waiting for a reading`, 'ok');
@@ -255,7 +295,7 @@ select { background: rgba(255,255,255,0.06); color: var(--fg); border: 1px solid
       if (/no longer in range/i.test(e.message)) {   // Chrome on macOS forgets a device ~3 min after the chooser last saw it advertise; only a new pick brings it back
         clearTimeout(state.bleRetry); state.ble = null; state.source = null;
         $('bleConnect').textContent = 'Connect by Bluetooth';
-        setStatus(`lost ${name}. open heartcast on the iphone, then press connect by bluetooth and pick it again`, 'bad');
+        setStatus(`lost ${name}. check it's on, then press connect by bluetooth and pick it again`, 'bad');
         return;
       }
       setStatus(`can't reach ${name}, retrying`, 'bad'); retryBle(device);
@@ -284,7 +324,7 @@ select { background: rgba(255,255,255,0.06); color: var(--fg); border: 1px solid
     ws.onmessage = ev => {
       let hr = null;
       try { const j = JSON.parse(ev.data); hr = j?.data?.heart_rate ?? j?.heart_rate ?? null; } catch (e) { hr = parseInt(ev.data, 10); }
-      if (hr && hr > 20 && hr < 250) { state.lastLiveAt = Date.now(); setStatus('live', 'ok'); pushSample(hr, 'live heart rate'); }
+      if (hr && hr > 20 && hr < 250) { noteLive(); setStatus('live', 'ok'); pushSample(hr, 'live heart rate'); }
     };
     ws.onerror = () => { if (state.ws === ws) setStatus('could not connect. Check the token and that the watch is measuring.', 'bad'); };
     ws.onclose = ev => { if (state.ws === ws) { state.ws = null; if (ev.code === 1000) setStatus('not connected'); else { setStatus('connection dropped, retrying', 'bad'); setTimeout(() => { if (state.source === 'pulsoid' && !state.ws) connect(); }, 5000); } } };
@@ -293,13 +333,14 @@ select { background: rgba(255,255,255,0.06); color: var(--fg); border: 1px solid
   function disconnectPulsoid() { if (state.ws) { const w = state.ws; state.ws = null; w.close(1000); } }
 
   // ---------- test mode: an exact fake reading, once a second and whenever the slider moves ----------
-  function startSim() { disconnectPulsoid(); disconnectBle(); state.source = 'sim'; setStatus('simulating', 'ok'); tickSim(); state.simTimer = setInterval(tickSim, 1000); }
+  function startSim() { disconnectPulsoid(); disconnectBle(); state.lastLiveAt = 0; resetSession(); state.source = 'sim'; setStatus('simulating', 'ok'); tickSim(); state.simTimer = setInterval(tickSim, 1000); }
   function tickSim() { pushSample(+$('sim').value, 'simulated heart rate'); }
-  function stopSim() { clearInterval(state.simTimer); if (state.source === 'sim') { state.source = null; setStatus('not connected'); } }
+  function stopSim() { clearInterval(state.simTimer); if (state.source === 'sim') { state.source = null; resetSession(); setStatus('not connected'); } }   // fake readings don't carry over
 
   // ---------- canopy drawing ----------
   const canvas = $('canopy'), ctx = canvas.getContext('2d');
-  let lights = [], shownHue = 280, shownT = 0.5;
+  const WAIT_BPM = 12, WAIT_LEVEL = 0.25;   // the waiting look, as in canopy.cpp: slow, dim, purple
+  let lights = [], shownHue = HUE_LOW, shownT = 0, shownLevel = WAIT_LEVEL;
   function resize() {
     canvas.width = innerWidth * devicePixelRatio; canvas.height = innerHeight * devicePixelRatio;
     ctx.setTransform(devicePixelRatio, 0, 0, devicePixelRatio, 0, 0);
@@ -308,14 +349,16 @@ select { background: rgba(255,255,255,0.06); color: var(--fg); border: 1px solid
   }
   function frame(now) {
     const t = targetT();
-    if (t != null) state.hue = hueFor(t);                 // re-evaluated every frame so the Tuning sliders apply at once
-    shownHue += (((state.hue - shownHue + 540) % 360) - 180) * 0.03;
-    shownT += ((t == null ? 0.5 : t) - shownT) * 0.03;
-    const bpm = state.smoothed ?? 70;
+    const waiting = t == null;                            // nobody there: the waiting look
+    if (!waiting) state.hue = hueFor(t);                  // re-evaluated every frame so the Tuning sliders apply at once
+    shownHue += ((((waiting ? HUE_LOW : state.hue) - shownHue + 540) % 360) - 180) * 0.03;
+    shownT += ((waiting ? 0 : t) - shownT) * 0.03;
+    shownLevel += ((waiting ? WAIT_LEVEL : 1) - shownLevel) * 0.03;
+    const bpm = waiting ? WAIT_BPM : state.smoothed;
     const beat = 0.5 + 0.5 * Math.sin((now / 1000) * (bpm / 60) * 2 * Math.PI);   // the lights breathe at the current heart rate
     ctx.fillStyle = '#000'; ctx.fillRect(0, 0, innerWidth, innerHeight);   // the field stays black; only the lights carry color
     for (const l of lights) {
-      const a = (0.45 + 0.45 * beat * (0.4 + 0.6 * shownT)) * (0.75 + 0.25 * Math.sin(now / 1000 * l.tw + l.ph));
+      const a = (0.45 + 0.45 * beat * (0.4 + 0.6 * shownT)) * (0.75 + 0.25 * Math.sin(now / 1000 * l.tw + l.ph)) * shownLevel;
       ctx.beginPath(); ctx.arc(l.x, l.y, l.r * 7, 0, Math.PI * 2); ctx.fillStyle = `hsl(${shownHue} 95% 55% / ${a * 0.12})`; ctx.fill();   // soft halo, as through fabric
       ctx.beginPath(); ctx.arc(l.x, l.y, l.r * 3, 0, Math.PI * 2); ctx.fillStyle = `hsl(${shownHue} 95% 60% / ${a * 0.35})`; ctx.fill();
       ctx.beginPath(); ctx.arc(l.x, l.y, l.r, 0, Math.PI * 2); ctx.fillStyle = `hsl(${shownHue} 90% 72% / ${a})`; ctx.fill();
@@ -327,14 +370,14 @@ select { background: rgba(255,255,255,0.06); color: var(--fg); border: 1px solid
   // ---------- wiring ----------
   $('bleConnect').onclick = connectBle;
   { const p = bleProblem(); if (p) $('bleHint').textContent = p + '.'; }   // say up front when this browser can't do it
-  setInterval(() => {   // like STALE_MS in canopy.cpp: a link that is up but silent is not live
+  setInterval(() => {   // like staleMs() in canopy.cpp: no reading for a few of the usual gaps -> waiting look, new sitter
+    if (!state.lastLiveAt || Date.now() - state.lastLiveAt <= staleMs()) return;
+    const secs = Math.round(staleMs() / 1000);
+    state.lastLiveAt = 0;
+    resetSession();
     const up = state.source === 'ble' ? !!(state.ble && state.ble.gatt.connected)
              : state.source === 'pulsoid' ? !!(state.ws && state.ws.readyState === WebSocket.OPEN) : false;
-    if (up && state.lastLiveAt && Date.now() - state.lastLiveAt > 20000) {
-      state.lastLiveAt = 0;
-      setStatus('connected, but no reading for 20 s. is the workout still running on the watch?', 'bad');
-      $('srcLabel').textContent = 'waiting for heart rate';
-    }
+    if (up) setStatus(`connected, but no heart rate for ${secs} s`, 'bad');   // a dropped link already says so itself
   }, 1000);
   $('connect').onclick = connect;
   $('token').addEventListener('keydown', e => { if (e.key === 'Enter') connect(); });
