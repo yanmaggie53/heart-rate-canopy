@@ -1,4 +1,4 @@
-// The canopy: reads a heart rate monitor over Bluetooth and colors the fairy lights with it.
+// The canopy: reads a heart rate monitor over Bluetooth and dims and warms the fairy lights with it.
 //
 // Heart rate source: the COOSPO HW807 optical armband (confirmed 2026-11-20, a reading every second).
 // It offers the standard Heart Rate Service (0x180D), like a Polar Verity Sense or H10, or an iPhone app
@@ -10,12 +10,25 @@
 // lights go back to the waiting look instead of showing a made-up number. (The HW807 doesn't report
 // skin contact, so this is for sensors that do.)
 //
+// Brightness and color: the same mapping as the web page (include/mapping.h). The first 30 s of readings
+// set where this sitter started; from there, as the heart slows, the lights fade toward a soft glow and move
+// down a warm gradient (include/palette.h) from honey toward ember, reaching the dimmest, deepest end 12 bpm
+// below the start; if it speeds up they brighten toward pale warm white. Both follow a 10 s rolling average
+// and ease quickly down and slowly up. Each light sits a little apart from the others on the gradient, so a
+// few neighboring warm tones show at once. A little slow twinkle per light, stiller as the canopy calms.
+// Breathing cue: whatever the heart rate, the whole string swells for INHALE_S (4 s) and fades for EXHALE_S
+// (6 s), about six slow breaths a minute with a long out-breath, for the sitter to breathe along with
+// (include/palette.h). The web stand-in draws all of this the same way.
+// While nobody is there (see "Who is sitting there" below), the string stays dim and ember-warm, still
+// breathing the cue so the empty canopy invites a slow breath, and the next reading starts a new sitter.
+//
 // Relay to the web page: the HW807 takes one Bluetooth connection at a time, so while the board holds it
 // the web page can't read it. So the board also advertises a heart rate signal of its own, named
-// RELAY_NAME ("Canopy"), and passes on every reading the lights use. The web page connects to it exactly
-// as it would to the armband. Between readings, while the lights show the waiting look, it sends
-// "nobody there" (skin contact supported but not detected, rate 0) every 2 s, so the page shows its waiting
-// look too. Turn it off with RELAY_TO_WEB = false: while on, anyone nearby with a Bluetooth app can read
+// RELAY_NAME ("Canopy"), and passes on every reading the lights use, with where this sitter started, so the
+// page dims and warms from the same start as the lights even if it connects partway through. The web page
+// connects to it exactly as it would to the armband. Whenever a new sitter starts, and every 2 s while the
+// lights show the waiting look, it sends "nobody there" (skin contact supported but not detected, rate 0), so
+// the page starts afresh and shows its waiting look too. Turn it off with RELAY_TO_WEB = false: while on, anyone nearby with a Bluetooth app can read
 // the sitter's heart rate, the same as they could read the armband itself.
 //
 // Who is sitting there: the HW807 can't tell when it's off the arm. Taken off and left switched on, it keeps
@@ -31,16 +44,12 @@
 //     pin labeled 5 (next to 4, where the lights' data wire goes), the other to a pin labeled GND; then set
 //     SEAT_PIN = 5 below.
 //
-// Color: the same fixed scale as the web page (include/mapping.h), purple at 55 bpm through blue, cyan,
-// green, yellow and orange to red at 95, following a rolling average of the last 5 s of readings. The
-// lights breathe (brightness swells and fades) at the current heart rate, with a little slow twinkle per
-// light, the way the web stand-in draws them. The hue eases toward its target rather than jumping.
-// While nobody is there, the string breathes slowly and dimly in purple so it is not just dark.
-//
 // Serial monitor (115200 baud, port labeled USB): prints what the Bluetooth side is doing and each
-// reading as "hr 72  avg 71.4  hue 165". Commands (type and press Enter):
+// reading as "hr 72  avg 71.4  start 75  level 0.64". Commands (type and press Enter):
 //   80       feed 80 bpm once a second instead of the Bluetooth reading (test mode, shown whatever the seat)
 //   live     back to the Bluetooth reading
+//   new      start a new sitter (forget where the last one started)
+//   hearth   switch the palette on the string (or coral, candle)
 //   sit      pretend a seat sensor is fitted and someone sat down (after SIT_MS)
 //   leave    pretend they got up (after LEAVE_MS)
 //   noseat   stop pretending (back to the real seat sensor, or to none)
@@ -54,7 +63,7 @@
 #include <FastLED.h>
 #include <NimBLEDevice.h>
 #include "mapping.h"
-#include "hue_rgb.h"
+#include "palette.h"
 
 // ---------- hardware: change these to match the bench ----------
 constexpr int    DATA_PIN     = 4;     // GPIO the string's data wire goes to (never 35, 36 or 37 on a WROOM-2)
@@ -92,9 +101,7 @@ constexpr unsigned long IDLE_RELAY_MS = 2000;  // while nobody is there, say so 
 
 // ---------- look ----------
 constexpr int   FRAME_MS      = 33;    // ~30 frames a second
-constexpr float HUE_EASE      = 0.06;  // share of the remaining hue difference closed each frame (web: 0.03 at 60 fps)
-constexpr float WAIT_BPM      = 12;    // the waiting look breathes at this rate, like slow breathing
-constexpr float WAIT_LEVEL    = 0.25;  // and this dim
+constexpr float WAIT_LEVEL    = 0.25;  // the waiting look's brightness (the calmest sitter gets DIM_FLOOR, in mapping.h)
 
 static const NimBLEUUID HR_SERVICE((uint16_t)0x180D);
 static const NimBLEUUID HR_MEASUREMENT((uint16_t)0x2A37);
@@ -102,16 +109,20 @@ static const NimBLEUUID BATTERY_SERVICE((uint16_t)0x180F);
 static const NimBLEUUID BATTERY_LEVEL((uint16_t)0x2A19);
 
 CRGB    leds[NUM_LEDS];
+int8_t  paletteOffset[NUM_LEDS];  // how far ahead of or behind the others each light sits on the gradient
+int     paletteIndex = CANOPY_PALETTE;
 uint8_t twinklePhase[NUM_LEDS];   // per-light offset so they don't all twinkle together
 uint8_t twinkleSpeed[NUM_LEDS];
 
 // Everything below is used from loop() only, except where marked: readings arrive on the NimBLE task and are
 // handed over through hrQueue, so the smoother and the session are never touched from two tasks at once.
 Smoother      smoother;
+StartRate     startRate;                  // where this sitter started (first 30 s)
 float         lastHr = 0;                 // most recent raw reading
 unsigned long lastReadingMs = 0;          // when it arrived (0 = none yet)
-float         shownHue = HUE_LOW;         // hue currently on the string, eased toward the target
-float         shownT = 0;                 // position on the scale, eased
+uint8_t       powerScale = 255;           // < 255 while SUPPLY_MA is holding the whole breath back (see drawFrame)
+float         shownLevel = WAIT_LEVEL;    // brightness currently on the string, eased toward the target;
+                                          // its place between DIM_FLOOR and 1 also sets the warmth
 int           testBpm = 0;                // >0 = fake reading from the serial monitor instead of Bluetooth
 unsigned long lastTestMs = 0;
 float         gapMs = 0;                  // the sensor's usual gap between readings (0 = not known yet)
@@ -158,8 +169,10 @@ bool isLive(unsigned long now) {
   return seatOk && lastReadingMs && now - lastReadingMs < staleMs() && smoother.hasValue();
 }
 
-// Forget the last sitter: the next reading starts afresh.
-void newSitter() { smoother.reset(); lastReadingMs = 0; }
+void relay(int hr, bool present);
+// Forget the last sitter: the next reading starts afresh. The web page is told at once ("nobody there"), so it
+// starts its new session from the same reading as the lights, whatever caused this (loop() only).
+void newSitter() { smoother.reset(); startRate.reset(); lastReadingMs = 0; relay(0, false); }
 
 void updateSeat(unsigned long now) {
   if (!hasSeat()) return;
@@ -176,10 +189,19 @@ void updateSeat(unsigned long now) {
 // ----- relay to the web page -----
 // Heart Rate Measurement as the web page reads it: flags (bit 2 = can tell contact, bit 1 = someone is there),
 // then the rate as one byte.
+// With a reading it also carries where this sitter started (tenths of a bpm) in the Energy Expended field (flags bit 3),
+// so a page that connects partway through measures brightness and warmth from the same start as the lights. The page
+// reads that field only from a device named Canopy; anything else reading it would see it as energy.
 void relay(int hr, bool present) {
   if (!relayChr) return;
-  const uint8_t v[2] = { (uint8_t)(0x04 | (present ? 0x02 : 0)), (uint8_t)(present ? hr : 0) };
-  relayChr->notify(v, sizeof v);   // sends these bytes as they are (setValue + notify() could race the NimBLE task)
+  if (!present) {
+    const uint8_t v[2] = { 0x04, 0 };
+    relayChr->notify(v, sizeof v);   // sends these bytes as they are (setValue + notify() could race the NimBLE task)
+    return;
+  }
+  const uint16_t start = startRate.hasValue() ? (uint16_t)lroundf(startRate.value() * 10) : 0;
+  const uint8_t v[4] = { 0x04 | 0x02 | 0x08, (uint8_t)hr, (uint8_t)(start & 0xFF), (uint8_t)(start >> 8) };
+  relayChr->notify(v, sizeof v);
 }
 
 class ServerCallbacks : public NimBLEServerCallbacks {
@@ -211,8 +233,15 @@ void onHeartRate(int hr, const char* source) {
   lastHr = hr;
   lastReadingMs = now;
   const float avg = smoother.push(hr, now);
-  const float hue = hueFor(targetT(mappedBpm(avg)));
-  Serial.printf("hr %3d  avg %5.1f  hue %3.0f  %s\n", hr, avg, hue, source);
+  const bool  wasFixed = startRate.isFixed();
+  startRate.push(hr, now);
+  if (startRate.isFixed() && !wasFixed)
+    Serial.printf("started at %.0f bpm: dimmest at %.0f, brightest at %.0f\n", startRate.value(),
+                  startRate.value() - CALM_DROP, startRate.value() + RISE_BPM);
+  const float level = levelFor(levelT(mappedBpm(avg), startRate.value()));
+  Serial.printf("hr %3d  avg %5.1f  start %5.1f%s  level %.2f  %s%s\n", hr, avg, startRate.value(),
+                startRate.isFixed() ? "" : "?", level, source,
+                powerScale < 255 ? "  (held back by SUPPLY_MA)" : "");
   relay(hr, true);
 }
 
@@ -264,7 +293,7 @@ void onNotify(NimBLERemoteCharacteristic* chr, uint8_t* data, size_t len, bool i
   }
   if (contact == 0) return;                // taken off the arm: whatever number it sends isn't a heart rate
   if (hr <= 20 || hr >= 250) return;       // not a real reading (0 is "sensor not on skin")
-  if (hrQueue) xQueueSend(hrQueue, &hr, 0);
+  if (hrQueue) xQueueSend(hrQueue, &hr, 0);   // handled in loop(), so only one task ever touches the session
 }
 
 class ScanCallbacks : public NimBLEScanCallbacks {
@@ -356,6 +385,21 @@ void printStatus(unsigned long now) {
   else Serial.println("seat: none fitted, presence comes from the readings alone");
   Serial.printf("lights: %s; a reading counts as missing after %lu s\n",
                 isLive(now) ? (testBpm > 0 ? "test mode" : "live") : "waiting look", staleMs() / 1000);
+  if (startRate.hasValue())
+    Serial.printf("sitter started at %.0f bpm%s; level %.2f; palette %s%s\n", startRate.value(),
+                  startRate.isFixed() ? "" : " (still measuring)", shownLevel, PALETTES[paletteIndex].name,
+                  powerScale < 255 ? "; held back by SUPPLY_MA" : "");
+  else Serial.printf("no sitter yet; palette %s\n", PALETTES[paletteIndex].name);
+}
+
+// ----- palette -----
+void usePalette(int index) {
+  paletteIndex = index;
+  Serial.printf("palette: %s\n", PALETTES[index].name);
+}
+void printPaletteNames() {
+  for (int i = 0; i < NUM_PALETTES; i++) Serial.printf(" %s", PALETTES[i].name);
+  Serial.println();
 }
 
 void readSerialCommands() {
@@ -369,6 +413,11 @@ void readSerialCommands() {
       else if (strcmp(line, "live") == 0) {
         testBpm = 0; newSitter();
         Serial.println("test mode off: using the bluetooth reading");
+      } else if (strcmp(line, "new") == 0) {
+        newSitter();
+        Serial.println("new sitter: the next 30 s of readings set where they start");
+      } else if (findPalette(line) >= 0) {
+        usePalette(findPalette(line));
       } else if (strcmp(line, "sit") == 0 || strcmp(line, "leave") == 0) {
         if (seatSim < 0) { seatTaken = !strcmp(line, "leave"); seatRawLast = seatTaken; seatRawSince = millis(); }
         seatSim = strcmp(line, "sit") == 0 ? 1 : 0;
@@ -387,7 +436,10 @@ void readSerialCommands() {
           if (testBpm == 0) newSitter();
           testBpm = v; lastTestMs = 0;
           Serial.printf("test mode: %d bpm once a second (type live to stop)\n", v);
-        } else Serial.println("type a heart rate between 21 and 249, live, sit, leave, noseat or status");
+        } else {
+          Serial.print("type a heart rate between 21 and 249, live, new, sit, leave, noseat, status, or a palette:");
+          printPaletteNames();
+        }
       }
       n = 0;
     } else if (n < (int)sizeof line - 1) line[n++] = c;
@@ -397,6 +449,9 @@ void readSerialCommands() {
 
 // ----- the look -----
 void drawFrame(unsigned long now) {
+  static unsigned long lastDrawMs = now;
+  const float dtS = (now - lastDrawMs) / 1000.0f;
+  lastDrawMs = now;
   const bool live = isLive(now);
   // The readings stopped. (When the seat is empty instead, updateSeat() already started a new sitter and said so.)
   if (lastReadingMs && now - lastReadingMs >= staleMs() && smoother.hasValue()) {
@@ -404,33 +459,38 @@ void drawFrame(unsigned long now) {
     newSitter();
   }
   const float sec = now / 1000.0f;
-  float targetHue, targetTVal, breathBpm, level;
-  if (live) {
-    targetTVal = targetT(mappedBpm(smoother.value()));
-    targetHue = hueFor(targetTVal);
-    breathBpm = smoother.value();
-    level = 1;
-  } else {                               // waiting: slow, dim, purple
-    targetTVal = 0;
-    targetHue = HUE_LOW;
-    breathBpm = WAIT_BPM;
-    level = WAIT_LEVEL;
-  }
-  // ease the hue the short way round the wheel, and the scale position
-  float d = fmodf(targetHue - shownHue + 540, 360) - 180;
-  shownHue = fmodf(shownHue + d * HUE_EASE + 360, 360);
-  shownT += (targetTVal - shownT) * HUE_EASE;
+  const float targetLevel = live ? levelFor(levelT(mappedBpm(smoother.value()), startRate.value()))
+                                 : WAIT_LEVEL;   // waiting: dim and ember-warm
+  shownLevel = easeLevel(shownLevel, targetLevel, dtS);   // quick to dim, slow to brighten
 
-  const CRGB base = hueToRgb(shownHue);
-  const float beat = 0.5f + 0.5f * sinf(sec * (breathBpm / 60) * 2 * PI);   // the lights breathe at the heart rate
-  const float swell = 0.45f + 0.45f * beat * (0.4f + 0.6f * shownT);        // a faster heart also swells harder
+  const float depth = clamp01((shownLevel - DIM_FLOOR) / (1 - DIM_FLOOR));   // 0 at the dimmest, 1 at full: this is
+                                                                             // the eased t, so it also sets the warmth
+  static float breathS = 0;              // seconds into the breathing cue's cycle, the same for sitter and empty canopy
+  breathS = fmodf(breathS + fminf(dtS, 0.25f), INHALE_S + EXHALE_S);   // at most 0.25 s a frame, so after loop() was
+                                                                       // blocked (a Bluetooth connect) the cue carries on
+                                                                       // from where it stopped instead of jumping
+  const float swell = swellFor(breathAt(breathS));                           // in for 4 s, out for 6 s
+  const Palette& pal = PALETTES[paletteIndex];
+  const float cap = BRIGHTNESS / 255.0f;   // the overall cap, applied here so each light is rounded only once
+  static CRGB  color[NUM_LEDS];            // this frame's color and brightness (before the breath) for each light
+  static float base[NUM_LEDS];
   for (int i = 0; i < NUM_LEDS; i++) {
-    const float tw = 0.75f + 0.25f * sinf(sec * (0.6f + twinkleSpeed[i] / 255.0f * 0.8f) + twinklePhase[i] / 255.0f * 2 * PI);
-    const float a = swell * tw * level;
-    leds[i] = base;
-    leds[i].nscale8_video((uint8_t)(a * 255));
+    const float wave = sinf(sec * (0.6f + twinkleSpeed[i] / 255.0f * 0.8f) + twinklePhase[i] / 255.0f * 2 * PI);
+    base[i]  = twinkleFor(wave, depth) * shownLevel * cap;
+    color[i] = ledColor(pal, lightPos(depth, paletteOffset[i] / 127.0f));   // warmer as the heart slows
   }
-  FastLED.show();
+  auto fill = [&](float breathSwell) {
+    for (int i = 0; i < NUM_LEDS; i++) {
+      const float a = base[i] * breathSwell;
+      leds[i] = CRGB(lroundf(color[i].r * a), lroundf(color[i].g * a), lroundf(color[i].b * a));
+    }
+  };
+  // Power: the supply limit is worked out for the top of the breath and applied to the whole breath, so a tight
+  // SUPPLY_MA dims every frame of it evenly instead of FastLED cutting off each inhale, which would flatten the cue.
+  fill(swellFor(1));
+  powerScale = calculate_max_brightness_for_power_mW(255, (uint32_t)SUPPLY_VOLTS * SUPPLY_MA);
+  fill(swell);
+  FastLED.show(powerScale);   // this frame is never above the breath's top, so FastLED's own limit doesn't cut in
 }
 
 void setup() {
@@ -438,20 +498,28 @@ void setup() {
   delay(500);
   FastLED.addLeds<WS2812B, DATA_PIN, COLOR_ORDER>(leds, NUM_LEDS);
   FastLED.setMaxPowerInVoltsAndMilliamps(SUPPLY_VOLTS, SUPPLY_MA);
-  FastLED.setBrightness(BRIGHTNESS);
+  FastLED.setBrightness(255);             // BRIGHTNESS is applied per light in drawFrame, so values are rounded once
+  FastLED.setDither(DISABLE_DITHER);      // off anyway below 100 fps; said here so the power estimates in drawFrame
+                                          // and in show() count the same thing
   FastLED.clear(true);
-  for (int i = 0; i < NUM_LEDS; i++) { twinklePhase[i] = random8(); twinkleSpeed[i] = random8(); }
+  for (int i = 0; i < NUM_LEDS; i++) {
+    twinklePhase[i] = random8(); twinkleSpeed[i] = random8();
+    paletteOffset[i] = (int8_t)(random8(255) - 127);   // -127..127
+  }
   if (SEAT_PIN >= 0) {
     pinMode(SEAT_PIN, INPUT_PULLUP);       // the switch pulls it to GND while someone sits
     seatTaken = seatRawLast = seatPressed();
   }
 
   Serial.printf("\ncanopy: %d lights on GPIO %d, brightness %d/255, supply limit %d mA\n", NUM_LEDS, DATA_PIN, BRIGHTNESS, SUPPLY_MA);
-  Serial.printf("scale: purple at %.0f bpm to red at %.0f, %.0f s rolling average%s\n", FLOOR_BPM, CEIL_BPM, SMOOTH_S,
-                STEPPED ? ", stepped" : "");
+  usePalette(CANOPY_PALETTE);
+  Serial.printf("dimming and warming: start = first %.0f s, dimmest (%.0f%%) and warmest %.0f bpm below it, "
+                "full and palest %.0f above, %.0f s rolling average%s\n",
+                START_S, DIM_FLOOR * 100, CALM_DROP, RISE_BPM, SMOOTH_S, STEPPED ? ", stepped" : "");
+  Serial.printf("breathing cue: in %.1f s, out %.1f s (%.1f breaths a minute)\n", INHALE_S, EXHALE_S, 60 / (INHALE_S + EXHALE_S));
   if (SEAT_PIN >= 0) Serial.printf("seat switch on GPIO %d\n", SEAT_PIN);
-  Serial.println("type a bpm for a fake reading, live to go back, sit / leave to pretend there's a seat sensor, "
-                 "noseat to stop, status");
+  Serial.println("type a bpm for a fake reading, live to go back, new for a new sitter, sit / leave to pretend there's");
+  Serial.print("a seat sensor, noseat to stop, status, or a palette name:"); printPaletteNames();
 
   hrQueue = xQueueCreate(8, sizeof(int));
   NimBLEDevice::init(RELAY_TO_WEB ? RELAY_NAME : "");

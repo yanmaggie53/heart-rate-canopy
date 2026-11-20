@@ -120,22 +120,27 @@ select { background: rgba(255,255,255,0.06); color: var(--fg); border: 1px solid
   <details>
     <summary>Tuning</summary>
     <div class="tune">
-      <label>Purple at <input type="range" id="floor" min="40" max="80" value="55"> <span class="v" id="floorV">55 bpm</span></label>
-      <label>Red at <input type="range" id="ceil" min="70" max="130" value="95"> <span class="v" id="ceilV">95 bpm</span></label>
+      <label>Palette <select id="palette"></select></label>
       <div class="swatches" id="swatches"></div>
-      <div class="ticks"><span id="tickLo">55</span><span id="tickMid">75</span><span id="tickHi">95 bpm</span></div>
-      <label>Smoothing <input type="range" id="smooth" min="0" max="30" value="5"> <span class="v" id="smoothV">5 s</span></label>
-      <label>Stepped palette, one color per <input type="range" id="step" min="1" max="6" value="2"> <span class="v" id="stepV">2 bpm</span></label>
-      <label><span><input type="checkbox" id="stepped"> use stepped palette</span></label>
+      <label>Dimmest and warmest at <input type="range" id="drop" min="4" max="25" value="12"> <span class="v" id="dropV">12 bpm below the start</span></label>
+      <label>Brightest and palest at <input type="range" id="rise" min="2" max="20" value="6"> <span class="v" id="riseV">6 bpm above</span></label>
+      <label>Dimmest glow <input type="range" id="dimFloor" min="0" max="60" value="20"> <span class="v" id="dimFloorV">20%</span></label>
+      <div class="swatches" id="dimScale"></div>
+      <div class="ticks"><span id="tickLo">-12</span><span>start</span><span id="tickHi">+6 bpm</span></div>
+      <label>Breathe in for <input type="range" id="inhale" min="2" max="8" step="0.5" value="4"> <span class="v" id="inhaleV">4 s</span></label>
+      <label>Breathe out for <input type="range" id="exhale" min="2" max="10" step="0.5" value="6"> <span class="v" id="exhaleV">6 s</span></label>
+      <label>Smoothing <input type="range" id="smooth" min="0" max="30" value="10"> <span class="v" id="smoothV">10 s</span></label>
+      <label>Stepped dimming, one step per <input type="range" id="step" min="1" max="6" value="2"> <span class="v" id="stepV">2 bpm</span></label>
+      <label><span><input type="checkbox" id="stepped"> use stepped dimming</span></label>
       <label>Started at <span class="v" id="startV">average of the first 30 s</span></label>
-      <div class="row"><button class="ghost" id="copyLog" type="button">Copy session as CSV</button><span class="hint" id="copied"></span></div>
+      <div class="row"><button class="ghost" id="copyLog" type="button">Copy session as CSV</button><button class="ghost" id="newSitter" type="button">New sitter</button><span class="hint" id="copied"></span></div>
       <div class="sim">
         <input type="checkbox" id="simOn" title="Test without a watch">
         <span>Test without a watch</span>
         <input type="range" id="sim" min="45" max="120" value="75">
         <span class="v" id="simV">75 bpm</span>
       </div>
-      <p class="hint">Test mode feeds an exact fake reading so each color can be checked without a watch. Connecting a live heart rate turns it off.</p>
+      <p class="hint">Test mode feeds an exact fake reading once a second. Its first 30 s set where the sitter started; then slide below that to watch the canopy dim and warm. New sitter starts over. Connecting a live heart rate turns test mode off.</p>
     </div>
   </details>
 </div>
@@ -144,7 +149,7 @@ select { background: rgba(255,255,255,0.06); color: var(--fg); border: 1px solid
 (function () {
   const $ = id => document.getElementById(id);
   // source: which live input is in charge ('ble', 'pulsoid', 'sim' or null), so a retry from one never knocks out another
-  const state = { source: null, ws: null, ble: null, bleRetry: null, lastLiveAt: 0, prevLiveAt: 0, gapMs: 0, tellsPresence: false, simTimer: null, smoothed: null, start: null, firstSampleAt: null, samples: [], opening: [], log: [], hue: 280 };
+  const state = { source: null, ws: null, ble: null, bleRetry: null, lastLiveAt: 0, prevLiveAt: 0, gapMs: 0, tellsPresence: false, simTimer: null, smoothed: null, start: null, firstSampleAt: null, samples: [], opening: [], log: [], level: null };
   const WAITING_SUB = 'Sit down and put on the armband. The canopy wakes when your heart rate comes in.';
 
   // ---------- who is there (as in canopy.cpp) ----------
@@ -164,25 +169,63 @@ select { background: rgba(255,255,255,0.06); color: var(--fg); border: 1px solid
     state.lastLiveAt = now;
   }
 
-  // ---------- mapping: a fixed scale in bpm ----------
-  // Tuned for people sitting in a gallery, mostly students: purple at the floor (55 bpm by default), red at the ceiling (95).
-  // Hue runs down the wheel from purple (280) through blue, cyan, green, yellow and orange to red (0): about 7 degrees per bpm
-  // with the default range, so a change of one beat per minute is a visible shift. t = 0 at the floor, 1 at the ceiling.
-  const HUE_LOW = 280, HUE_HIGH = 0;
-  const floorBpm = () => +$('floor').value;
-  const ceilBpm = () => Math.max(floorBpm() + 5, +$('ceil').value);
-  function targetT() {
+  // ---------- mapping: heart rate -> brightness and warmth, measured from where the sitter started ----------
+  // Same as firmware/include/mapping.h. The first 30 s of readings set where this sitter started (the running average until
+  // then); the lights sit at about three quarters there, in honey gold, fade toward a soft glow and deepen toward ember as the
+  // heart slows to "dimmest at" below the start, and reach full brightness and pale warm white "brightest at" above it.
+  // Measured from each sitter's own start, so no color or brightness stands for a fixed bpm that could be read off.
+  //   t = (hr - (start - drop)) / (drop + rise), clamped 0..1;  level = dimFloor + (1 - dimFloor) * t
+  // The warmth is the same t, eased with the brightness: see lightPos() below.
+  const START_S = 30, DIM_TAU_S = 4, BRIGHTEN_TAU_S = 12;   // quick to dim, slow to brighten
+  const WAIT_LEVEL = 0.25;                                  // brightness while no heart rate is live, like canopy.cpp
+  const calmDrop = () => +$('drop').value;
+  const riseBpm = () => +$('rise').value;
+  const dimFloor = () => +$('dimFloor').value / 100;
+  const clamp01 = x => Math.max(0, Math.min(1, x));
+  const mean = a => a.reduce((s, x) => s + x, 0) / a.length;
+  // The canopy board sends its own start with each relayed reading (relayStart); when it does, that is the start, so the page
+  // and the lights measure from the same point even if the page connected partway through a sitter.
+  const startRate = () => state.relayStart ?? state.start ?? (state.opening.length ? mean(state.opening) : null);
+  const levelT = (hr, start) => clamp01((hr - (start - calmDrop())) / (calmDrop() + riseBpm()));
+  const levelFor = t => dimFloor() + (1 - dimFloor()) * clamp01(t);
+  function targetLevel() {
     if (state.smoothed == null) return null;
     let hr = state.smoothed;
     if ($('stepped').checked) { const s = +$('step').value; hr = Math.round(hr / s) * s; }
-    return Math.max(0, Math.min(1, (hr - floorBpm()) / (ceilBpm() - floorBpm())));
+    return levelFor(levelT(hr, startRate()));
   }
-  const hueFor = t => HUE_LOW - (HUE_LOW - HUE_HIGH) * Math.max(0, Math.min(1, t));
+  const easeLevel = (shown, target, dtS) => shown + (target - shown) * (1 - Math.exp(-dtS / (target < shown ? DIM_TAU_S : BRIGHTEN_TAU_S)));
+
+  // ---------- palettes: must match firmware/include/palette.h ----------
+  // Warm gradients from the calmest end (0, deep ember) to the most stirred (1, pale warm white). Every stop is warm, so the canopy
+  // feels calm from the moment someone sits down. Each light sits a little ahead of or behind the others along the gradient
+  // (SPREAD), so a few neighboring warm tones show at once rather than one flat color.
+  const PALETTES = {
+    hearth: ['#FF3D0D', '#FF7A1F', '#FFB347', '#FFDDB0'],   // ember, amber, honey, warm white
+    coral:  ['#E8344A', '#FF6B5A', '#FFA07A', '#FFD6B8'],   // deep coral, coral, salmon, peach white
+    candle: ['#FF8A2A', '#FFB061', '#FFD29A', '#FFE9CF'],   // amber to candle white: a narrower range
+  };
+  const SPREAD = 0.12;
+  const rgb = hex => [1, 3, 5].map(i => parseInt(hex.slice(i, i + 2), 16));
+  const STOPS = Object.fromEntries(Object.entries(PALETTES).map(([n, hexes]) => [n, hexes.map(rgb)]));
+  function paletteColor(name, pos) {
+    const stops = STOPS[name];
+    if (stops.length === 1) return stops[0];
+    const x = clamp01(pos) * (stops.length - 1), i = Math.min(Math.floor(x), stops.length - 2), f = x - i;
+    return stops[i].map((c, k) => Math.round(c + (stops[i + 1][k] - c) * f));
+  }
+  // Where one light sits on the gradient: t squeezed into SPREAD..1-SPREAD, plus its own offset (-1..1) times SPREAD.
+  const lightPos = (t, offset) => SPREAD + clamp01(t) * (1 - 2 * SPREAD) + Math.max(-1, Math.min(1, offset)) * SPREAD;
+  const paletteName = () => $('palette').value;
+  const css = (c, alpha = 1) => `rgb(${c.join(' ')} / ${alpha})`;
   function drawSwatches() {
     const el = $('swatches'); el.innerHTML = '';
-    for (let i = 0; i < 40; i++) { const s = document.createElement('i'); s.style.background = `hsl(${hueFor(i / 39)} 85% 55%)`; el.appendChild(s); }
-    $('tickLo').textContent = floorBpm(); $('tickMid').textContent = Math.round((floorBpm() + ceilBpm()) / 2); $('tickHi').textContent = ceilBpm() + ' bpm';
-    $('floorV').textContent = floorBpm() + ' bpm'; $('ceilV').textContent = ceilBpm() + ' bpm';
+    for (let i = 0; i < 40; i++) { const s = document.createElement('i'); s.style.background = css(paletteColor(paletteName(), i / 39)); el.appendChild(s); }
+    const dim = $('dimScale'); dim.innerHTML = '';   // what the canopy does along the scale: color and brightness together
+    for (let i = 0; i < 40; i++) { const s = document.createElement('i'); s.style.background = css(paletteColor(paletteName(), lightPos(i / 39, 0)), Math.pow(levelFor(i / 39), 1 / 2.2)); dim.appendChild(s); }   // alpha as the lights draw it
+    $('dropV').textContent = calmDrop() + ' bpm below the start'; $('riseV').textContent = riseBpm() + ' bpm above';
+    $('dimFloorV').textContent = $('dimFloor').value + '%';
+    $('tickLo').textContent = '-' + calmDrop(); $('tickHi').textContent = '+' + riseBpm() + ' bpm';
   }
 
   // ---------- readings ----------
@@ -193,21 +236,21 @@ select { background: rgba(255,255,255,0.06); color: var(--fg); border: 1px solid
     state.samples = state.samples.filter(s => now - s.t <= Math.max(win, 1));
     state.smoothed = win === 0 ? hr : state.samples.reduce((a, s) => a + s.hr, 0) / state.samples.length;
     if (!state.firstSampleAt) state.firstSampleAt = now;
-    // "Started at" is the average of the first 30 s. It only feeds the line under the reading; the color is on the fixed scale.
-    if (state.start == null) { state.opening.push(hr); if (now - state.firstSampleAt >= 30000) setStart(); }
-    state.hue = hueFor(targetT());
-    state.log.push(`${new Date(now).toISOString().slice(11, 19)},${hr},${state.smoothed.toFixed(1)},${state.hue.toFixed(0)}`);
+    // "Started at" is the average of the first 30 s: the point the dimming is measured from.
+    if (state.start == null) { state.opening.push(hr); if (now - state.firstSampleAt >= START_S * 1000) setStart(); }
+    state.log.push(`${new Date(now).toISOString().slice(11, 19)},${hr},${state.smoothed.toFixed(1)},${startRate().toFixed(1)},${targetLevel().toFixed(2)}`);
     $('bpm').textContent = Math.round(hr);
     $('srcLabel').textContent = source;
-    if (state.start == null) { $('sub').textContent = 'Sit still and breathe slowly. A slower heart turns the canopy cooler.'; }
+    if (state.relayStart != null) $('startV').textContent = Math.round(state.relayStart) + ' bpm (from the canopy board)';
+    if (state.start == null) { $('sub').textContent = 'Breathe in as the lights swell, out as they fade. As your heart slows, the canopy dims and warms.'; }
     else {
-      const d = Math.round(state.smoothed - state.start);
+      const d = Math.round(state.smoothed - startRate());
       $('sub').textContent = d <= -1 ? `${-d} bpm lower than when you sat down.` : d >= 1 ? `${d} bpm higher than when you sat down.` : 'Same as when you sat down.';
     }
   }
-  function setStart() { state.start = Math.round(state.opening.reduce((a, b) => a + b, 0) / state.opening.length); $('startV').textContent = state.start + ' bpm'; }
+  function setStart() { state.start = Math.round(state.opening.reduce((a, b) => a + b, 0) / state.opening.length); if (state.relayStart == null) $('startV').textContent = state.start + ' bpm'; }
   function resetSession() {   // a new sitter: forget the last one, back to the waiting look
-    state.start = null; state.opening = []; state.samples = []; state.smoothed = null; state.firstSampleAt = null;
+    state.start = null; state.relayStart = null; state.opening = []; state.samples = []; state.smoothed = null; state.firstSampleAt = null;
     $('startV').textContent = 'average of the first 30 s';
     $('bpm').textContent = '--'; $('srcLabel').textContent = 'waiting for heart rate'; $('sub').textContent = WAITING_SUB;
   }
@@ -234,7 +277,9 @@ select { background: rgba(255,255,255,0.06); color: var(--fg); border: 1px solid
     const flags = dv.getUint8(0);
     const hr = (flags & 0x01) ? dv.getUint16(1, true) : dv.getUint8(1);
     const contact = (flags & 0x04) ? !!(flags & 0x02) : null;   // null: this sensor can't tell
-    return { hr, contact };
+    const at = (flags & 0x01) ? 3 : 2;   // Energy Expended (flags bit 3) follows the rate; the canopy board puts its start there, x10
+    const energy = (flags & 0x08) && dv.byteLength >= at + 2 ? dv.getUint16(at, true) : null;
+    return { hr, contact, energy };
   }
   function nobodyThere(name) {   // the canopy board (or a sensor off the skin) says nobody is there
     state.lastLiveAt = 0;
@@ -284,7 +329,11 @@ select { background: rgba(255,255,255,0.06); color: var(--fg); border: 1px solid
         // Rate 0 with contact "no" is the canopy board saying nobody is there. A sensor briefly off the skin
         // (contact "no" with a rate) is just a missing reading, as in canopy.cpp.
         if (contact === false) { if (hr === 0) nobodyThere(name); return; }
-        if (hr > 20 && hr < 250) { noteLive(); setStatus(`live from ${name}`, 'ok'); pushSample(hr, 'live heart rate'); }
+        if (hr > 20 && hr < 250) {
+          // only the canopy board's relay uses the energy field for its start; from a real sensor it would be energy
+          if (/^canopy/i.test(name) && r.energy) state.relayStart = r.energy / 10;
+          noteLive(); setStatus(`live from ${name}`, 'ok'); pushSample(hr, 'live heart rate');
+        }
       };
       await ch.startNotifications();
       if (state.ble === device) setStatus(`connected to ${name}, waiting for a reading`, 'ok');
@@ -339,31 +388,42 @@ select { background: rgba(255,255,255,0.06); color: var(--fg); border: 1px solid
 
   // ---------- canopy drawing ----------
   const canvas = $('canopy'), ctx = canvas.getContext('2d');
-  const WAIT_BPM = 12, WAIT_LEVEL = 0.25;   // the waiting look, as in canopy.cpp: slow, dim, purple
-  let lights = [], shownHue = HUE_LOW, shownT = 0, shownLevel = WAIT_LEVEL;
+  let lights = [], shownLevel = WAIT_LEVEL, lastFrame = null, breathS = 0;   // breathS: seconds into the breathing cue, like canopy.cpp
+  // The breathing cue, as breathAt/swellFor in palette.h: the whole canopy swells for "breathe in" seconds and fades for
+  // "breathe out" (4 and 6 by default, about six breaths a minute with a long out-breath), whatever the heart rate and
+  // whether or not anyone is sitting. The heart rate shows only as brightness and warmth.
+  const inhaleS = () => +$('inhale').value, exhaleS = () => +$('exhale').value;
+  function breathAt(s) {   // 0 empty .. 1 full, a smooth rise then a smooth fall
+    const i = inhaleS(), e = exhaleS(); s = ((s % (i + e)) + i + e) % (i + e);
+    return s < i ? 0.5 - 0.5 * Math.cos(Math.PI * s / i) : 0.5 + 0.5 * Math.cos(Math.PI * (s - i) / e);
+  }
+  const swellFor = breath => 0.5 + 0.4 * breath;
+  // The twinkle, as twinkleFor in palette.h: shallower as the canopy calms, so a calm canopy is still apart from the breath.
+  const twinkleFor = (wave, depth) => 1 - (0.15 + 0.35 * depth) * (0.5 - 0.5 * wave);
   function resize() {
     canvas.width = innerWidth * devicePixelRatio; canvas.height = innerHeight * devicePixelRatio;
     ctx.setTransform(devicePixelRatio, 0, 0, devicePixelRatio, 0, 0);
     const n = Math.round((innerWidth * innerHeight) / 7000);
-    lights = Array.from({ length: n }, () => ({ x: Math.random() * innerWidth, y: Math.random() * innerHeight * 0.72, r: 1.8 + Math.random() * 2.6, ph: Math.random() * Math.PI * 2, tw: 0.6 + Math.random() * 0.8 }));
+    lights = Array.from({ length: n }, () => ({ x: Math.random() * innerWidth, y: Math.random() * innerHeight * 0.72, r: 1.8 + Math.random() * 2.6, ph: Math.random() * Math.PI * 2, tw: 0.6 + Math.random() * 0.8, off: Math.random() * 2 - 1 }));
   }
   function frame(now) {
-    const t = targetT();
-    const waiting = t == null;                            // nobody there: the waiting look
-    if (!waiting) state.hue = hueFor(t);                  // re-evaluated every frame so the Tuning sliders apply at once
-    shownHue += ((((waiting ? HUE_LOW : state.hue) - shownHue + 540) % 360) - 180) * 0.03;
-    shownT += ((waiting ? 0 : t) - shownT) * 0.03;
-    shownLevel += ((waiting ? WAIT_LEVEL : 1) - shownLevel) * 0.03;
-    const bpm = waiting ? WAIT_BPM : state.smoothed;
-    const beat = 0.5 + 0.5 * Math.sin((now / 1000) * (bpm / 60) * 2 * Math.PI);   // the lights breathe at the current heart rate
+    const dtS = lastFrame == null ? 0 : (now - lastFrame) / 1000; lastFrame = now;   // real time, so easing keeps pace even when frames are throttled
+    const target = targetLevel();                         // re-evaluated every frame so the Tuning sliders apply at once
+    shownLevel = easeLevel(shownLevel, target ?? WAIT_LEVEL, dtS);
+    const depth = clamp01((shownLevel - dimFloor()) / (1 - dimFloor() || 1));   // 0 at the dimmest, 1 at full: the eased t, so it also sets the warmth
+    breathS = (breathS + Math.min(dtS, 0.25)) % (inhaleS() + exhaleS());   // at most 0.25 s a frame, like canopy.cpp, so a stall pauses the cue instead of jumping it
+    const swell = swellFor(breathAt(breathS));   // in, then a longer out
     ctx.fillStyle = '#000'; ctx.fillRect(0, 0, innerWidth, innerHeight);   // the field stays black; only the lights carry color
+    const name = paletteName();
     for (const l of lights) {
-      const a = (0.45 + 0.45 * beat * (0.4 + 0.6 * shownT)) * (0.75 + 0.25 * Math.sin(now / 1000 * l.tw + l.ph)) * shownLevel;
-      ctx.beginPath(); ctx.arc(l.x, l.y, l.r * 7, 0, Math.PI * 2); ctx.fillStyle = `hsl(${shownHue} 95% 55% / ${a * 0.12})`; ctx.fill();   // soft halo, as through fabric
-      ctx.beginPath(); ctx.arc(l.x, l.y, l.r * 3, 0, Math.PI * 2); ctx.fillStyle = `hsl(${shownHue} 95% 60% / ${a * 0.35})`; ctx.fill();
-      ctx.beginPath(); ctx.arc(l.x, l.y, l.r, 0, Math.PI * 2); ctx.fillStyle = `hsl(${shownHue} 90% 72% / ${a})`; ctx.fill();
+      // a is linear brightness, like an LED's duty; drawn over black in screen space it needs alpha a^(1/2.2) to look as bright
+      const a = Math.pow(swell * twinkleFor(Math.sin(now / 1000 * l.tw + l.ph), depth) * shownLevel, 1 / 2.2);
+      const c = paletteColor(name, lightPos(depth, l.off)), core = c.map(v => Math.round(v + (255 - v) * 0.35));   // warmer as the heart slows; a lighter core
+      ctx.beginPath(); ctx.arc(l.x, l.y, l.r * 7, 0, Math.PI * 2); ctx.fillStyle = css(c, a * 0.12); ctx.fill();   // soft halo, as through fabric
+      ctx.beginPath(); ctx.arc(l.x, l.y, l.r * 3, 0, Math.PI * 2); ctx.fillStyle = css(c, a * 0.35); ctx.fill();
+      ctx.beginPath(); ctx.arc(l.x, l.y, l.r, 0, Math.PI * 2); ctx.fillStyle = css(core, a); ctx.fill();
     }
-    document.documentElement.style.setProperty('--glow', `hsl(${shownHue} 90% 65% / 0.55)`);   // the text glows faintly in the same color
+    document.documentElement.style.setProperty('--glow', css(paletteColor(name, lightPos(depth, 0)), 0.25 + 0.4 * shownLevel));   // the text glows faintly in the current warmth
     requestAnimationFrame(frame);
   }
 
@@ -383,11 +443,17 @@ select { background: rgba(255,255,255,0.06); color: var(--fg); border: 1px solid
   $('token').addEventListener('keydown', e => { if (e.key === 'Enter') connect(); });
   $('simOn').onchange = () => $('simOn').checked ? startSim() : stopSim();
   $('sim').oninput = () => { $('simV').textContent = $('sim').value + ' bpm'; if ($('simOn').checked) tickSim(); };
-  $('floor').oninput = $('ceil').oninput = drawSwatches;
+  $('palette').innerHTML = Object.keys(PALETTES).map(n => `<option>${n}</option>`).join('');
+  try { const p = localStorage.getItem('canopy_palette'); if (p in PALETTES) $('palette').value = p; } catch (e) {}
+  $('palette').onchange = () => { try { localStorage.setItem('canopy_palette', paletteName()); } catch (e) {} drawSwatches(); };
+  $('drop').oninput = $('rise').oninput = $('dimFloor').oninput = drawSwatches;
   $('smooth').oninput = () => $('smoothV').textContent = $('smooth').value + ' s';
+  $('inhale').oninput = () => $('inhaleV').textContent = $('inhale').value + ' s';
+  $('exhale').oninput = () => $('exhaleV').textContent = $('exhale').value + ' s';
   $('step').oninput = () => $('stepV').textContent = $('step').value + ' bpm';
+  $('newSitter').onclick = () => { resetSession(); if ($('simOn').checked) tickSim(); };
   $('copyLog').onclick = () => {
-    navigator.clipboard.writeText('time,raw,smoothed,hue\n' + state.log.join('\n'))
+    navigator.clipboard.writeText('time,raw,smoothed,start,level\n' + state.log.join('\n'))
       .then(() => { $('copied').textContent = `copied ${state.log.length} rows`; setTimeout(() => $('copied').textContent = '', 2000); })
       .catch(() => { $('copied').textContent = 'clipboard blocked by browser'; });
   };
